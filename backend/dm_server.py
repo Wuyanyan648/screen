@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """display-manager 本地 Web 服务：把界面和 JSON API 暴露在 127.0.0.1。
 
-只用标准库（http.server），无需装包。启动后浏览器打开 http://127.0.0.1:<port>/
+只用标准库（http.server），无需装包。固定监听 127.0.0.1:8765（被占用即报错退出），
+根路径 `/` 直接返回 web/display-manager.html；界面与 JSON API 都在这一个服务里。
 """
 
 import json
 import os
 import sys
 import threading
+import time
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dm_core as core  # noqa: E402
+import dm_hotkey  # noqa: E402
 import dm_idle  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -57,8 +60,21 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/log":
             self._json({"ok": True, "lines": core.read_log_tail(80)})
             return
-        if path == "/":
-            self.path = "/index.html"
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+        # 根路径即界面：只认 display-manager.html 这一个入口，不再保留 index.html
+        if path in ("/", "/display-manager.html"):
+            self.path = "/display-manager.html"
+        elif path == "/index.html":
+            body = b"index.html is gone, use /display-manager.html"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         super().do_GET()
 
     def do_POST(self):
@@ -104,17 +120,14 @@ def serve(argv: list[str]) -> int:
             open_browser = False; i += 1; continue
         i += 1
 
-    srv = None
-    for p in range(port, port + 20):
-        try:
-            srv = ThreadingHTTPServer(("127.0.0.1", p), Handler)
-            port = p
-            break
-        except OSError:
-            continue
-    if srv is None:
-        print("端口 %d~%d 都被占用，无法启动" % (port, port + 19), file=sys.stderr)
-        return 1
+    # 固定端口，占用即退出（不再漂移到别的端口，避免浏览器书签/自启指向错地址）
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        print("端口 %d 无法监听（%s）。可能已有一个实例在跑，"
+              "用 `ss -lntp | grep %d` 或 `curl -s http://127.0.0.1:%d/api/state` 确认。"
+              % (port, e, port, port), file=sys.stderr)
+        return 3
 
     url = "http://127.0.0.1:%d/" % port
     core.log("启动网页界面 %s（pid=%d）" % (url, os.getpid()))
@@ -124,13 +137,35 @@ def serve(argv: list[str]) -> int:
         lambda: {o["name"]: (o["x"], o["y"], o["w"], o["h"]) for o in core.screen_rects()})
     monitor.start()
     core.set_idle_provider(monitor.report)
+    # 等监视线程把 X 连接建起来（最多 1.5 秒），否则日志会把「刚启动」误写成「不可用」
+    for _ in range(15):
+        rep = monitor.report()
+        if rep["damage_ok"] or rep["error"]:
+            break
+        time.sleep(0.1)
     rep = monitor.report()
     core.log("闲置检测启动: damage=%s screensaver=%s 依据=%s%s" % (
         rep["damage_ok"], rep["screensaver_ok"], rep["basis"],
         ("  错误: " + rep["error"]) if rep["error"] else ""))
 
+    # 全局快捷键：Ctrl+Alt+Shift+F12 = 恢复全部（不自锁的救急入口）
+    def _hotkey_restore():
+        with LOCK:
+            try:
+                r = core.restore_all("hotkey")
+                core.log("快捷键 %s 恢复全部: %s" % (dm_hotkey.KEY_COMBO, r.get("message")))
+            except Exception as e:
+                core.log("快捷键恢复失败: %r" % e)
+
+    hotkey = dm_hotkey.HotkeyListener(_hotkey_restore)
+    hotkey.start()
+    time.sleep(0.5)
+    core.log("全局快捷键注册: %s -> restore-all，ok=%s%s" % (
+        dm_hotkey.KEY_COMBO, hotkey.ok, ("  错误: " + hotkey.error) if hotkey.error else ""))
+
     print("display-manager 界面: %s" % url)
     print("闲置检测依据: %s" % rep["basis"])
+    print("全局快捷键: %s = 恢复全部输出" % dm_hotkey.KEY_COMBO)
     print("命令行同一套逻辑: python3 %s list|on|off|restore-all" %
           os.path.join(ROOT, "backend", "dm_cli.py"))
     print("按 Ctrl-C 退出（不会改动当前显示布局）")
@@ -142,6 +177,7 @@ def serve(argv: list[str]) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        hotkey.stop()
         monitor.stop()
         srv.server_close()
         core.log("网页界面已退出")

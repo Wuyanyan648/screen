@@ -462,9 +462,6 @@ def plan_off(name: str) -> dict:
         raise DMError("%s 当前不是 connected（%s），无法关闭" % (name, o["status"]))
     if not o["enabled"]:
         raise DMError("%s 已经是关闭状态" % name)
-    if o["panel"]:
-        raise DMError("拒绝关闭：%s 是笔记本内屏（ConnectorType: Panel），"
-                      "与 screen-off.sh 的策略保持一致" % name)
     if snap["enabled_count"] <= 1:
         raise DMError("拒绝关闭：%s 是当前唯一启用的输出，关掉后将没有任何显示输出" % name)
     if not o["mode"] or not o["rate"]:

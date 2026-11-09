@@ -7,8 +7,8 @@
 <style>
   :root{
     --bg:#0f1216; --panel:#171c22; --panel2:#1e252d; --line:#2a333d;
-    --text:#e6edf3; --dim:#8b98a5; --on:#3fb950; --on-dim:#12351f;
-    --off:#f0883e; --danger:#f85149; --accent:#58a6ff; --primary:#d2a8ff;
+    --text:#e6edf3; --dim:#8b98a5; --on:#3fb950; --off:#f0883e;
+    --danger:#f85149; --accent:#58a6ff; --primary:#d2a8ff;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
@@ -25,6 +25,12 @@
   .meta{color:var(--dim);font-size:12px}
   .meta b{color:var(--text);font-weight:600}
   .spacer{flex:1}
+  .conn{
+    font-size:11.5px;padding:2px 9px;border-radius:10px;border:1px solid var(--line);
+    color:var(--dim);white-space:nowrap;
+  }
+  .conn.ok{color:#7ee787;border-color:#2ea043;background:#12281a}
+  .conn.bad{color:#ffb3ad;border-color:#8b2c2c;background:#2a1414}
   button{
     font:inherit;color:var(--text);background:var(--panel2);
     border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer;
@@ -37,6 +43,10 @@
   button.danger{background:#3a1a1a;border-color:#8b2c2c;color:#ff9c96}
   button.danger:hover:not(:disabled){background:#4c1f1f}
   button.ghost{background:transparent}
+  select{
+    font:inherit;color:var(--text);background:#0d1117;border:1px solid var(--line);
+    border-radius:5px;padding:4px 6px;cursor:pointer;
+  }
   main{flex:1;display:flex;min-height:0}
   #stage{flex:1;min-width:0;display:flex;flex-direction:column;padding:14px 16px;gap:10px}
   #canvasWrap{
@@ -46,7 +56,7 @@
   #layout{width:100%;height:100%;display:block}
   .rbox{cursor:pointer}
   .rbox rect{transition:.15s}
-  .rbox:hover rect{filter:brightness(1.25)}
+  .rbox:hover rect.screen{filter:brightness(1.22)}
   #offTray{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .chip{
     display:flex;align-items:center;gap:8px;background:var(--panel);border:1px dashed var(--line);
@@ -64,7 +74,7 @@
     cursor:pointer;
   }
   .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
-  .card h3{margin:0 0 6px;font-size:13px;display:flex;align-items:center;gap:6px}
+  .card h3{margin:0 0 6px;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
   .badge{font-size:11px;font-weight:500;padding:1px 6px;border-radius:10px;border:1px solid var(--line);color:var(--dim)}
   .badge.live{color:#7ee787;border-color:#2ea043;background:#12281a}
   .badge.dead{color:#ff9c96;border-color:#8b2c2c;background:#2a1414}
@@ -75,7 +85,9 @@
   .cardActions{display:flex;gap:8px;margin-top:9px}
   .cardActions button{flex:1;padding:5px 8px}
   .help{font-size:11.5px;color:var(--dim);line-height:1.65}
-  .help code{color:#c9d1d9;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:11px}
+  .asideFoot{padding:10px 12px;border-top:1px solid var(--line)}
+  .asideFoot summary{cursor:pointer;color:var(--dim);font-size:12px;outline:none}
+  .asideFoot .help{margin-top:8px}
   #mask{
     position:fixed;inset:0;background:rgba(3,6,10,.72);display:none;
     align-items:center;justify-content:center;padding:20px;z-index:50;
@@ -93,6 +105,16 @@
   .dangerBox{border:1px solid #8b2c2c;background:#2a1414;color:#ffb3ad;border-radius:8px;padding:9px 11px;font-size:12px;line-height:1.6}
   .warnBox{border:1px solid #9e6a03;background:#2b2007;color:#ffd28a;border-radius:8px;padding:9px 11px;font-size:12px;line-height:1.6}
   .modalActions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
+  .toggleRow{display:flex;align-items:center;gap:8px;margin-top:12px}
+  .toggleBtn{
+    display:flex;align-items:center;gap:7px;padding:5px 10px;font-size:12px;
+    background:#1b2430;border:1px solid var(--line);border-radius:7px;
+  }
+  .toggleBtn .dot{
+    width:10px;height:10px;border-radius:50%;background:#39424d;border:1px solid #4b5763;
+  }
+  .toggleBtn.on{border-color:#2ea043;background:#12281a;color:#7ee787}
+  .toggleBtn.on .dot{background:#3fb950;border-color:#3fb950}
   #toast{
     position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
     background:#1f2730;border:1px solid var(--line);border-radius:8px;padding:9px 16px;
@@ -100,6 +122,13 @@
   }
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   #toast.err{border-color:#8b2c2c;background:#2a1414;color:#ffb3ad}
+  #autoBar{
+    position:fixed;left:50%;bottom:76px;transform:translateX(-50%);
+    display:none;align-items:center;gap:12px;z-index:55;
+    background:#1b2430;border:1px solid #2ea043;border-radius:9px;padding:9px 14px;font-size:12.5px;
+    box-shadow:0 10px 30px rgba(0,0,0,.5);
+  }
+  #autoBar.show{display:flex}
   #logBox{
     display:none;position:fixed;right:16px;bottom:16px;width:min(620px,46vw);max-height:44vh;
     overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:10px;
@@ -112,20 +141,25 @@
 <body>
 <header>
   <h1>显示器输出管理</h1>
-  <div class="meta">画布 <b id="canvasSize">-</b> ｜ 启用 <b id="enabledCount">-</b> 块 ｜ 状态时间 <b id="stamp">-</b> ｜ 闲置判据 <b id="idleBasis">-</b></div>
+  <span id="conn" class="conn">● 连接中…</span>
+  <div class="meta">画布 <b id="canvasSize">-</b> · 启用 <b id="enabledCount">-</b> 块 · 更新于 <b id="stamp">-</b></div>
   <div class="spacer"></div>
+  <label class="meta" style="display:flex;align-items:center;gap:6px">
+    闲置阈值
+    <select id="thresholdSel" title="某块屏超过这个时间没有画面变化，就在布局图上提示闲置">
+      <option value="0">不提醒</option>
+      <option value="60">1 分钟</option>
+      <option value="120">2 分钟</option>
+      <option value="300">5 分钟</option>
+      <option value="600">10 分钟</option>
+      <option value="900">15 分钟</option>
+      <option value="1800">30 分钟</option>
+      <option value="3600">1 小时</option>
+    </select>
+  </label>
   <button id="btnRefresh" class="ghost">刷新</button>
   <button id="btnRestore" class="ghost">恢复全部</button>
   <button id="btnLog" class="ghost">日志</button>
-  <label class="meta" style="display:flex;align-items:center;gap:6px">
-    闲置阈值
-    <input type="number" id="threshold" min="30" max="86400" step="30"
-           style="width:78px;background:#0d1117;color:var(--text);border:1px solid var(--line);border-radius:5px;padding:4px 6px;font:inherit;text-align:right">
-    秒
-  </label>
-  <label class="meta" style="display:flex;align-items:center;gap:6px">
-    <input type="checkbox" id="autoRefresh" checked> 自动刷新 2s
-  </label>
 </header>
 
 <main>
@@ -138,14 +172,19 @@
 
   <aside>
     <div class="asideScroll" id="cards"></div>
-    <div style="padding:10px 12px;border-top:1px solid var(--line)">
-      <div class="help">
-        命令行同一套逻辑：<br>
-        <code>python3 backend/dm_cli.py list</code><br>
-        <code>python3 backend/dm_cli.py off HDMI-0</code> /
-        <code>on HDMI-0</code><br>
-        <code>python3 backend/dm_cli.py restore-all</code>
-      </div>
+    <div class="asideFoot">
+      <details>
+        <summary>闲置提醒是怎么判断的（点开看局限）</summary>
+        <div class="help" id="idleHelp">
+          当前判据：<b id="idleBasis">-</b><br>
+          原理：在 X11 根窗口上监听画面变化（XDamage），把变化区域和各屏的位置做交集，
+          近似判断「这块屏多久没变化」。这只是近似信号，不是精确测量：<br>
+          · 静止的桌面/壁纸本来就没变化，可能被误判为闲置；<br>
+          · 屏亮着但没人看也会被判闲置；<br>
+          · 视频若走硬件叠加层，可能完全不产生变化事件。<br>
+          所以这里只做提醒，是否关闭由你点按钮决定，绝不自动关。
+        </div>
+      </details>
     </div>
   </aside>
 </main>
@@ -155,6 +194,11 @@
     <h2 id="mTitle">确认关闭</h2>
     <div class="rows" id="mRows"></div>
     <div id="mWarn"></div>
+    <div class="toggleRow" id="mAutoRow" style="display:none">
+      <button type="button" id="mAutoToggle" class="toggleBtn on">
+        <span class="dot"></span><span id="mAutoText">关掉后 20 秒自动开回来</span>
+      </button>
+    </div>
     <div class="modalActions">
       <button id="mCancel">取消</button>
       <button id="mOk" class="danger">确认关闭</button>
@@ -162,19 +206,32 @@
   </div>
 </div>
 
+<div id="autoBar">
+  <span id="autoBody"></span>
+  <button id="autoCancel" class="ghost">取消自动恢复</button>
+</div>
+
 <div id="toast"></div>
 <div id="logBox"></div>
 
 <script>
 const $ = s => document.querySelector(s);
+const POLL_MS = 2000;
+const AUTO_RESTORE_MS = 20000;
+
 let state = null;
 let selected = null;
 let busy = false;
 let dialogOpen = false;
+let connected = null;        // null=未知 true=已连接 false=断开
+let autoRestoreWanted = true;
+let autoTimer = null;
+let lastSig = null;          // 结构签名：没变化就不重建 DOM，避免每 2 秒重绘导致按钮点不中
 
 /* ---------------- 数据 ---------------- */
 async function fetchState(){
   const r = await fetch('/api/state', {cache:'no-store'});
+  if(!r.ok) throw new Error('HTTP ' + r.status);
   const j = await r.json();
   if(!j.ok) throw new Error(j.error || '读取状态失败');
   return j;
@@ -198,14 +255,31 @@ function toast(msg, isErr){
   t._tid = setTimeout(()=>{ t.className = isErr ? 'err' : ''; }, 5200);
 }
 
-async function refresh(quiet){
+function setConn(ok){
+  if(ok){
+    if(connected === false) toast('已重新连上本地服务');
+    connected = true;
+    $('#conn').textContent = '● 已连接';
+    $('#conn').className = 'conn ok';
+  }else{
+    connected = false;
+    $('#conn').textContent = '● 服务未连接，自动重试中';
+    $('#conn').className = 'conn bad';
+  }
+}
+
+async function refresh(manual){
   try{
     state = await fetchState();
-    // 状态里已不存在的选择清掉
     if(selected && !state.outputs.some(o=>o.name===selected)) selected = null;
+    setConn(true);
     render();
+    if(manual) toast('状态已更新');
+    return true;
   }catch(e){
-    if(!quiet) toast('刷新失败：' + e.message, true);
+    setConn(false);
+    if(manual) toast('暂时连不上本地服务，页面会自动重试', true);
+    return false;
   }
 }
 
@@ -216,15 +290,47 @@ function svgEl(tag, attrs){
   return el;
 }
 
+function svgText(parent, x, y, txt, size, color, weight){
+  const t = svgEl('text', {
+    x, y, 'text-anchor':'middle', fill:color,
+    'font-size':size, 'font-weight':weight || 400,
+    'font-family':'"Noto Sans CJK SC",sans-serif',
+    'pointer-events':'none'
+  });
+  t.textContent = txt;
+  parent.appendChild(t);
+  return t;
+}
+
+// 在屏块内部画一个可点击按钮；disabled 时只画灰条，不响应点击
+function svgButton(parent, o, label, disabled, isDanger, onClick){
+  const fs = Math.max(24, Math.min(92, o.h*0.058));
+  const bw = Math.min(o.w*0.34, Math.max(label.length*fs*0.72 + fs*2.0, fs*7.5));
+  const bh = fs*2.05;
+  const bx = o.x + o.w/2 - bw/2;
+  const by = o.y + o.h - bh - o.h*0.05;
+  const g = svgEl('g', {style: disabled ? 'cursor:not-allowed' : 'cursor:pointer'});
+  g.appendChild(svgEl('rect', {
+    x:bx, y:by, width:bw, height:bh, rx:bh*0.32,
+    fill: disabled ? '#20262e' : (isDanger ? '#3a1a1a' : '#17351f'),
+    stroke: disabled ? '#39424d' : (isDanger ? '#8b2c2c' : '#2ea043'),
+    'stroke-width':Math.max(2, fs*0.09)
+  }));
+  svgText(g, bx+bw/2, by+bh*0.68, label, fs,
+          disabled ? '#6e7b88' : (isDanger ? '#ffb3ad' : '#7ee787'), 600);
+  if(!disabled){
+    g.addEventListener('click', ev=>{ ev.stopPropagation(); onClick(); });
+  }
+  parent.appendChild(g);
+}
+
 function renderCanvas(){
   const svg = $('#layout');
   svg.innerHTML = '';
   const on = state.outputs.filter(o=>o.enabled);
   if(!on.length){
     svg.setAttribute('viewBox', '0 0 100 60');
-    const t = svgEl('text', {x:50,y:32,fill:'#8b98a5','font-size':4,'text-anchor':'middle'});
-    t.textContent = '当前没有任何启用的输出';
-    svg.appendChild(t);
+    svgText(svg, 50, 32, '当前没有任何启用的输出', 4, '#8b98a5');
     return;
   }
   const pad = Math.max(...on.map(o=>o.h)) * 0.025;
@@ -235,12 +341,14 @@ function renderCanvas(){
   svg.setAttribute('viewBox', `${x0} ${y0} ${x1-x0} ${y1-y0}`);
   svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
 
-  // 画布外框（所有屏的包围盒）
   const box = state.canvas;
-  svg.appendChild(svgEl('rect', {
-    x: box.x, y: box.y, width: box.w, height: box.h, fill:'none',
-    stroke:'#2a333d', 'stroke-width': pad*0.12, 'stroke-dasharray': `${pad*0.5} ${pad*0.35}`
-  }));
+  if(box){
+    svg.appendChild(svgEl('rect', {
+      x: box.x, y: box.y, width: box.w, height: box.h, fill:'none',
+      stroke:'#2a333d', 'stroke-width': pad*0.12,
+      'stroke-dasharray': `${pad*0.5} ${pad*0.35}`
+    }));
+  }
 
   const overlapped = new Set();
   (state.overlaps||[]).forEach(o=>{ overlapped.add(o.a); overlapped.add(o.b); });
@@ -250,17 +358,26 @@ function renderCanvas(){
     const isOv = overlapped.has(o.name);
     const gw = svgEl('g', {class:'rbox'});
     const rect = svgEl('rect', {
+      class:'screen',
       x:o.x, y:o.y, width:o.w, height:o.h, rx:Math.min(o.w,o.h)*0.012,
       fill: sel ? '#1b3b5c' : '#182129',
       stroke: isOv ? '#f85149' : (sel ? '#58a6ff' : '#39424d'),
       'stroke-width': Math.max(2, Math.min(o.w,o.h)*0.004)
     });
-    rect.addEventListener('click', ()=>{ selected = o.name; render(); });
+    rect.addEventListener('click', ()=>{ selected = o.name; render(true); });
     gw.appendChild(rect);
+
+    // 闲置：只把底色压暗，文字与按钮保持可读
+    if(o.idle){
+      gw.appendChild(svgEl('rect', {
+        x:o.x, y:o.y, width:o.w, height:o.h, rx:Math.min(o.w,o.h)*0.012,
+        fill:'rgba(4,7,10,.45)', 'pointer-events':'none'
+      }));
+    }
 
     const fs = Math.max(24, Math.min(96, o.h*0.062));
     const cx = o.x + o.w/2;
-    let ty = o.y + o.h/2 - fs*1.5;
+    let ty = o.y + o.h/2 - fs*2.0;
     const lines = [
       {t:o.name + (o.primary ? '  ★ primary' : ''), s:fs*1.35, c:'#e6edf3', w:600},
       {t:`${o.w}×${o.h}  @ ${o.x},${o.y}`, s:fs*0.8, c:'#9fb0c0'},
@@ -268,26 +385,21 @@ function renderCanvas(){
       {t:`缩放 ${o.scale ? o.scale.toFixed(0)+'%' : '-'}（transform ${o.transform ? o.transform[0].toFixed(4) : '-'}）`, s:fs*0.8, c:'#9fb0c0'},
       {t: o.panel ? '内屏 · 已启用' : '已启用', s:fs*0.8, c:'#7ee787'},
     ];
-    for(const ln of lines){
-      const t = svgEl('text', {
-        x:cx, y:ty, 'text-anchor':'middle', fill:ln.c,
-        'font-size':ln.s, 'font-weight':ln.w||400,
-        'font-family':'"Noto Sans CJK SC",sans-serif'
-      });
-      t.textContent = ln.t;
-      gw.appendChild(t);
-      ty += ln.s*1.45;
+    for(const ln of lines){ svgText(gw, cx, ty, ln.t, ln.s, ln.c, ln.w); ty += ln.s*1.45; }
+
+    // 每块屏自带开关按钮（内屏也允许关，唯一硬限制是不能关掉最后一块亮屏）
+    if(state.enabled_count <= 1){
+      svgButton(gw, o, '最后一块亮屏不可关', true, false);
+    }else{
+      svgButton(gw, o, o.panel ? '关闭（内屏）' : (o.idle ? '关闭此输出' : '关闭'),
+                false, true, ()=>doOff(o.name));
     }
 
-    // 闲置：整块变暗 + 角标（非模态提醒），角标可一键关闭该输出
+    // 闲置角标（非模态，点角标直接走关闭确认）
     if(o.idle){
-      gw.appendChild(svgEl('rect', {
-        x:o.x, y:o.y, width:o.w, height:o.h, rx:Math.min(o.w,o.h)*0.012,
-        fill:'rgba(4,7,10,.55)', 'pointer-events':'none'
-      }));
       const bfs = Math.max(18, Math.min(52, o.h*0.034));
-      const label = `闲置 ${fmtDur(o.idle_seconds)}　关闭此输出`;
-      const bw = label.length * bfs * 0.66 + bfs*1.6;
+      const label = `闲置 ${fmtDur(o.idle_seconds)}　关闭`;
+      const bw = label.length * bfs * 0.66 + bfs*1.8;
       const bh = bfs * 1.95;
       const bx = o.x + o.w - bw - o.w*0.02;
       const by = o.y + o.h*0.02;
@@ -296,13 +408,7 @@ function renderCanvas(){
         x:bx, y:by, width:bw, height:bh, rx:bh*0.35,
         fill:'#3a1a1a', stroke:'#f85149', 'stroke-width':Math.max(2, bfs*0.09)
       }));
-      const bt = svgEl('text', {
-        x:bx+bw/2, y:by+bh*0.66, 'text-anchor':'middle', fill:'#ffb3ad',
-        'font-size':bfs, 'font-weight':600, 'font-family':'"Noto Sans CJK SC",sans-serif',
-        'pointer-events':'none'
-      });
-      bt.textContent = label;
-      badge.appendChild(bt);
+      svgText(badge, bx+bw/2, by+bh*0.68, label, bfs, '#ffb3ad', 600);
       badge.addEventListener('click', ev=>{ ev.stopPropagation(); doOff(o.name); });
       gw.appendChild(badge);
     }
@@ -338,7 +444,7 @@ function renderTray(){
     b.textContent = '开启';
     b.onclick = e=>{ e.stopPropagation(); doOn(o.name); };
     chip.appendChild(b);
-    chip.onclick = ()=>{ selected = o.name; render(); };
+    chip.onclick = ()=>{ selected = o.name; render(true); };
     tray.appendChild(chip);
   }
 }
@@ -351,8 +457,8 @@ function renderCards(){
     const card = document.createElement('div');
     card.className = 'card' + (o.name===selected ? ' sel':'');
     const badges = [];
-    if(o.enabled) badges.push('<span class="badge live">已启用</span>');
-    else badges.push('<span class="badge dead">已关闭</span>');
+    badges.push(o.enabled ? '<span class="badge live">已启用</span>'
+                          : '<span class="badge dead">已关闭</span>');
     if(o.primary) badges.push('<span class="badge info">primary</span>');
     if(o.panel) badges.push('<span class="badge warn">内屏</span>');
     if(o.off_marked) badges.push('<span class="badge">你关闭的</span>');
@@ -375,7 +481,7 @@ function renderCards(){
       const hint = document.createElement('div');
       hint.className = 'help';
       hint.style.marginTop = '7px';
-      hint.textContent = `这块屏 ${fmtDur(o.idle_seconds)} 没有画面变化，要不要关掉？（判据：${o.idle_basis}）`;
+      hint.textContent = `这块屏 ${fmtDur(o.idle_seconds)} 没有画面变化，要不要关掉？（${o.idle_basis}）`;
       card.appendChild(hint);
     }
 
@@ -384,15 +490,11 @@ function renderCards(){
     if(o.enabled){
       const b = document.createElement('button');
       b.className = 'danger';
-      b.textContent = o.idle ? '关闭此输出' : '关闭';
-      if(o.panel){
-        b.disabled = true;
-        b.title = '内屏（ConnectorType: Panel）不允许从本界面关闭';
-        b.textContent = '内屏不可关闭';
-      }else if(state.enabled_count <= 1){
+      b.textContent = o.panel ? '关闭（内屏）' : (o.idle ? '关闭此输出' : '关闭');
+      if(state.enabled_count <= 1){
         b.disabled = true;
         b.title = '这是最后一块启用的屏，不能关闭';
-        b.textContent = '关闭（不可用）';
+        b.textContent = '最后一块亮屏不可关';
       }
       b.onclick = e=>{ e.stopPropagation(); doOff(o.name); };
       acts.appendChild(b);
@@ -404,19 +506,53 @@ function renderCards(){
       acts.appendChild(b);
     }
     card.appendChild(acts);
-    card.onclick = ()=>{ selected = o.name; render(); };
+    card.onclick = ()=>{ selected = o.name; render(true); };
     box.appendChild(card);
   }
 }
 
-function render(){
+function syncThreshold(){
+  const sel = $('#thresholdSel');
+  const v = state.config ? state.config.idle_threshold : 300;
+  if(document.activeElement === sel) return;
+  let opt = Array.from(sel.options).find(x=>Number(x.value) === v);
+  if(!opt){
+    opt = document.createElement('option');
+    opt.value = String(v);
+    opt.textContent = v === 0 ? '不提醒' : `自定义 ${v} 秒`;
+    sel.appendChild(opt);
+  }
+  sel.value = String(v);
+}
+
+// 只把「会改变结构/文案」的字段放进来；闲置秒数按分钟取整，避免每 2 秒重绘
+function structuralSig(s){
+  return JSON.stringify({
+    canvas: s.canvas,
+    n: s.enabled_count,
+    th: s.config && s.config.idle_threshold,
+    basis: s.idle && s.idle.basis,
+    ov: s.overlaps || [],
+    sel: selected,
+    o: s.outputs.map(o=>[
+      o.name, o.status, o.enabled, o.primary, o.panel, o.off_marked, o.idle,
+      o.x, o.y, o.w, o.h, o.mode, o.rate, o.scale,
+      o.transform ? o.transform[0] : null,
+      o.idle ? Math.floor((o.idle_seconds||0)/60) : null
+    ])
+  });
+}
+
+function render(force){
   if(!state) return;
+  $('#stamp').textContent = state.time;
+  const sig = structuralSig(state);
+  if(!force && sig === lastSig) return;
+  lastSig = sig;
   $('#canvasSize').textContent = fmtCanvas(state.canvas);
   $('#enabledCount').textContent = state.enabled_count;
-  $('#stamp').textContent = state.time;
   $('#idleBasis').textContent = state.idle ? state.idle.basis : '-';
-  const th = $('#threshold');
-  if(state.config && document.activeElement !== th) th.value = state.config.idle_threshold;
+  syncThreshold();
   renderCanvas();
   renderTray();
   renderCards();
@@ -437,15 +573,10 @@ function isBrowserScreen(o){
 async function doOff(name){
   const o = state.outputs.find(x=>x.name===name);
   if(!o) return;
-  if(o.panel){
-    toast('拒绝关闭：这是笔记本内屏（ConnectorType: Panel），本界面不允许关闭', true);
-    return;
-  }
   if(state.enabled_count <= 1){
     toast('拒绝关闭：这是当前唯一启用的输出，关掉后将没有任何画面', true);
     return;
   }
-  // 关闭后剩余块数与画布尺寸：先用本地数据算一遍用于确认，服务端会再校验一次
   const rest = state.outputs.filter(x=>x.enabled && x.name!==name);
   const c = rest.length ? {
     w: Math.max(...rest.map(x=>x.x+x.w)) - Math.min(...rest.map(x=>x.x)),
@@ -456,20 +587,33 @@ async function doOff(name){
     ['要关闭', `${name}${o.panel?'（内屏）':''}`],
     ['关闭后剩余', `${rest.length} 块：${rest.map(x=>x.name).join(', ') || '无'}`],
     ['画布尺寸', `${fmtCanvas(state.canvas)} → ${rest.length ? fmtCanvas(c) : '无（会拒绝）'}`],
-    ['恢复方式', `<code>python3 ~/eric/wuyan_github/screen/backend/dm_cli.py on ${name}</code>`],
   ];
-  if(o.idle){
-    rows.splice(1, 0, ['关闭原因', `画面已 ${fmtDur(o.idle_seconds)} 无变化（${o.idle_basis}）`]);
-  }
+  if(o.idle) rows.splice(1, 0, ['关闭原因', `画面已 ${fmtDur(o.idle_seconds)} 无变化（${o.idle_basis}）`]);
   $('#mRows').innerHTML = rows.map(([k,v])=>
     `<div class="row"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
 
+  const selfScreen = isBrowserScreen(o);
   const warns = [];
-  if(o.panel) warns.push('这是笔记本内屏（ConnectorType: Panel）。');
-  if(isBrowserScreen(o)) warns.push('这个界面所在的屏就是它，关掉后界面会消失，请用上面的命令行恢复，或重新启动界面后点「开启」。');
-  if(o.primary) warns.push('这是 primary 屏，关闭后 primary 会转移。');
+  if(o.panel){
+    warns.push(`这是笔记本内屏（${name}），关掉后笔记本自带面板会黑屏；` +
+               `画面会留在剩下的 ${rest.length} 块屏上（${rest.map(x=>x.name).join(', ') || '无'}）。`);
+  }
+  if(selfScreen) warns.push('这个界面正好在这块屏上，关掉后界面会从眼前消失；可用下面默认勾选的「自动开回来」，或命令行恢复。');
+  if(o.primary) warns.push('这是 primary 屏，关闭后 primary 会转移到别的屏。');
   $('#mWarn').innerHTML = warns.length
     ? `<div class="dangerBox">⚠ ${warns.join('<br>⚠ ')}</div>` : '';
+
+  // 只有关掉「界面自己所在的屏」才提供自动开回的保险
+  const autoRow = $('#mAutoRow');
+  if(selfScreen){
+    autoRow.style.display = 'flex';
+    autoRestoreWanted = true;
+    $('#mAutoToggle').className = 'toggleBtn on';
+    $('#mAutoText').textContent = `关掉后 ${AUTO_RESTORE_MS/1000} 秒自动开回来（推荐）`;
+  }else{
+    autoRow.style.display = 'none';
+    autoRestoreWanted = false;
+  }
 
   dialogOpen = true;
   $('#mask').classList.add('show');
@@ -484,24 +628,29 @@ async function doOff(name){
   busy = true;
   const r = await post('/api/off', {name});
   busy = false;
-  if(r.ok){ toast(r.message); if(r.state){ state = r.state; render(); } }
-  else toast('关闭失败：' + (r.error||'未知错误'), true);
-  refresh(true);
+  if(r.ok){
+    toast(r.message || `已关闭 ${name}`);
+    if(r.state){ state = r.state; render(); }
+    if(selfScreen && autoRestoreWanted) scheduleAutoRestore(name);
+  }else{
+    toast('关闭失败：' + (r.error||'未知错误'), true);
+  }
+  refresh(false);
 }
 
 async function doOn(name){
   busy = true;
-  toast(`正在开启 ${name} …`);
   const r = await post('/api/on', {name});
   busy = false;
   if(r.ok){
     toast((r.message||`已开启 ${name}`) + (r.geometry ? `（${r.geometry}）` : '') +
           (r.warning ? ' ｜ 注意: ' + r.warning : ''));
     if(r.state){ state = r.state; render(); }
+    clearAutoRestore(true);
   }else{
     toast('开启失败：' + (r.error||'未知错误'), true);
   }
-  refresh(true);
+  refresh(false);
 }
 
 async function doRestoreAll(){
@@ -510,7 +659,30 @@ async function doRestoreAll(){
   busy = false;
   toast(r.message || (r.ok?'已恢复':'恢复失败'), !r.ok);
   if(r.state){ state = r.state; render(); }
-  refresh(true);
+  refresh(false);
+}
+
+/* 自动开回：关掉界面自己所在的屏后，页面仍在后台运行，到点自动开回来 */
+function scheduleAutoRestore(name){
+  clearAutoRestore(false);
+  $('#autoBody').textContent =
+    `${name} 已关闭，${AUTO_RESTORE_MS/1000} 秒后自动开回来…`;
+  $('#autoBar').classList.add('show');
+  autoTimer = setTimeout(async ()=>{
+    autoTimer = null;
+    const r = await post('/api/on', {name});
+    toast(r.ok ? `已自动开回 ${name}` : '自动开回失败：' + (r.error||'未知错误'), !r.ok);
+    clearAutoRestore(true);
+    refresh(false);
+  }, AUTO_RESTORE_MS);
+}
+
+function clearAutoRestore(silent){
+  if(autoTimer){ clearTimeout(autoTimer); autoTimer = null; }
+  if($('#autoBar').classList.contains('show')){
+    $('#autoBar').classList.remove('show');
+    if(!silent) toast('已取消自动恢复；这块屏可以用「恢复全部」再开回来');
+  }
 }
 
 async function showLog(){
@@ -522,31 +694,38 @@ async function showLog(){
 }
 
 /* ---------------- 事件 ---------------- */
-$('#btnRefresh').onclick = ()=> refresh(false);
+$('#btnRefresh').onclick = ()=> refresh(true);
 $('#btnRestore').onclick = ()=> doRestoreAll();
 $('#btnLog').onclick = showLog;
-$('#autoRefresh').onchange = ()=>{ schedule(); };
-$('#threshold').onchange = async e=>{
-  const v = parseInt(e.target.value, 10);
-  if(!Number.isFinite(v)){ toast('阈值需要是整数秒', true); return; }
-  const r = await post('/api/config', {idle_threshold: v});
-  if(r.ok){ toast(`闲置阈值已设为 ${r.config.idle_threshold} 秒`); refresh(true); }
-  else toast('保存失败：' + (r.error||'未知错误'), true);
+$('#autoCancel').onclick = ()=> clearAutoRestore(false);
+$('#mAutoToggle').onclick = ()=>{
+  autoRestoreWanted = !autoRestoreWanted;
+  const b = $('#mAutoToggle');
+  b.className = 'toggleBtn' + (autoRestoreWanted ? ' on' : '');
+  $('#mAutoText').textContent = autoRestoreWanted
+    ? `关掉后 ${AUTO_RESTORE_MS/1000} 秒自动开回来（推荐）`
+    : '不自动开回（需要用恢复入口手动救）';
 };
-document.addEventListener('keydown', e=>{
-  if(e.key === 'r' && !e.metaKey && !e.ctrlKey) refresh(false);
+$('#thresholdSel').onchange = async e=>{
+  const v = Number(e.target.value);
+  const r = await post('/api/config', {idle_threshold: v});
+  if(r.ok){
+    toast(v === 0 ? '已关闭闲置提醒' : `闲置阈值已设为 ${v < 60 ? v+' 秒' : (v/60)+' 分钟'}`);
+    refresh(false);
+  }else{
+    toast('保存失败：' + (r.error||'未知错误'), true);
+  }
+};
+
+// 自动更新：每 2 秒拉一次状态；关闭弹窗/操作进行中时暂停，避免打架
+setInterval(()=>{
+  if(!dialogOpen && !busy) refresh(false);
+}, POLL_MS);
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden && !dialogOpen && !busy) refresh(false);
 });
 
-let timer = null;
-function schedule(){
-  clearInterval(timer);
-  if($('#autoRefresh').checked){
-    timer = setInterval(()=>{ if(!dialogOpen && !busy) refresh(true); }, 2000);
-  }
-}
-
 refresh(false);
-schedule();
 </script>
 </body>
 </html>
