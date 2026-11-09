@@ -621,14 +621,24 @@ def turn_on(name: str, reason: str = "cli") -> dict:
             "message": "已启用 %s（%s）" % (name, src)}
 
 
-def set_brightness(name: str, value) -> dict:
-    """设置亮度（0~100）。通道选择见 dm_brightness.py：硬件背光/DDC 优先，其次软件调光。"""
+def set_brightness(name: str, value, extra=None) -> dict:
+    """设置亮度（0~100）。通道选择见 dm_brightness.py：硬件背光/DDC 优先，其次软件调光。
+
+    extra 是硬件到底（0）后的软件叠加层 0~100；None 表示不改动已有叠加。
+    """
     try:
         v = int(value)
     except (TypeError, ValueError):
         raise DMError("亮度必须是 0~100 的整数")
     if not 0 <= v <= 100:
         raise DMError("亮度必须在 0~100 之间")
+    if extra is not None:
+        try:
+            extra = int(extra)
+        except (TypeError, ValueError):
+            raise DMError("软件叠加必须是 0~100 的整数")
+        if not 0 <= extra <= 100:
+            raise DMError("软件叠加必须在 0~100 之间")
 
     snap = snapshot()
     o = _find(snap, name)
@@ -637,12 +647,36 @@ def set_brightness(name: str, value) -> dict:
 
     import dm_brightness
     try:
-        entry = dm_brightness.set_value(o, v)
+        entry = dm_brightness.set_value(o, v, extra=extra)
     except dm_brightness.BrightError as e:
         raise DMError(str(e))
     return {"ok": True, "name": name, "brightness": entry,
             "message": "%s 亮度已设为 %s%%（%s）" % (
-                name, entry["value"], entry["mode_label"])}
+                name, entry["value"], entry.get("label") or entry["mode_label"])}
+
+
+def set_brightness_extra(name: str, extra) -> dict:
+    """只调软件叠加层（硬件必须已经在 0）。"""
+    try:
+        x = int(extra)
+    except (TypeError, ValueError):
+        raise DMError("软件叠加必须是 0~100 的整数")
+    if not 0 <= x <= 100:
+        raise DMError("软件叠加必须在 0~100 之间")
+
+    snap = snapshot()
+    o = _find(snap, name)
+    if not o["connected"]:
+        raise DMError("%s 当前不是 connected（%s）" % (name, o["status"]))
+
+    import dm_brightness
+    try:
+        entry = dm_brightness.set_extra(o, x)
+    except dm_brightness.BrightError as e:
+        raise DMError(str(e))
+    return {"ok": True, "name": name, "brightness": entry,
+            "message": "%s 软件叠加已设为 %d%%（%s）" % (
+                name, entry["extra"], entry.get("label") or entry["mode_label"])}
 
 
 def brightness_state(refresh: bool = False) -> dict:

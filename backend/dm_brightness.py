@@ -13,7 +13,15 @@
 三条通道的优先级：硬件背光（内屏）/ DDC（外接）→ 软件 gamma → 不支持。
 「软件调光」改的是显卡 gamma，亮度下降时对比度也会变，界面必须单独标注。
 
-持久化：~/.cache/display-manager.brightness.json，服务启动和「关→开」后都会重新下发。
+叠加（2026-11-10 起）：硬件通道仍是主调节，但 AOC 硬件 VCP 10 打到 0 后绝对亮度
+仍偏高。所以硬件通道下额外允许一层「软件叠加」`extra`（0~100），只有硬件已经到 0
+时才生效，gamma = 1 - 0.70 * extra/100（extra=100 → 0.30，即最低约压到 30% 白光）。
+- 纯软件通道（便携屏）不叠加：主滑杆本身就是 gamma，再叠一层没有意义。
+- 硬件非 0 时叠加一律撤销并把 gamma 复位 1.0，避免白损失对比度。
+- 硬件写失败回落软件，记录里写 `fallback`，界面/CLI 明示原因。
+
+持久化：~/.cache/display-manager.brightness.json，每块屏记 `{value, mode, extra, time}`，
+硬件与叠加两路值都落盘，服务启动和「关→开」后都会重新下发。
 """
 
 from __future__ import annotations
@@ -100,10 +108,16 @@ def _stored() -> dict:
         return {}
 
 
-def _store(name: str, value: int, mode: str) -> None:
+def _store(name: str, value: int, mode: str, extra: int = 0,
+           fallback: dict | None = None) -> None:
+    """落盘。value 是主通道值（硬件百分比；纯软件时是 gamma 百分比），
+    extra 是硬件到底后叠加的软件层（0 = 不叠加）。"""
     data = _stored()
-    data[name] = {"value": int(value), "mode": mode,
-                  "time": datetime.now().strftime("%F %T")}
+    rec = {"value": int(value), "mode": mode, "extra": int(extra),
+           "time": datetime.now().strftime("%F %T")}
+    if fallback:
+        rec["fallback"] = fallback
+    data[name] = rec
     os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = BRIGHT_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -341,9 +355,10 @@ def _ddc_set(bus: str, pct: int) -> None:
 # --------------------------------------------------------------------------- #
 # 软件调光（xrandr gamma）
 # --------------------------------------------------------------------------- #
-def _sw_set(name: str, pct: int) -> None:
+def _sw_apply(name: str, gamma: float) -> None:
+    """直接下发 gamma 值（0.00~1.00）。"""
     rc, out, err = _run(["xrandr", "--output", name, "--brightness",
-                         "%.2f" % (pct / 100.0)], 10)
+                         "%.2f" % gamma], 10)
     if rc != 0:
         detail = (err or out).strip()
         if "Need crtc" in detail:
@@ -351,9 +366,30 @@ def _sw_set(name: str, pct: int) -> None:
         raise BrightError("xrandr 设置 gamma 失败：%s" % (detail or "无输出"))
 
 
+def _sw_set(name: str, pct: int) -> None:
+    _sw_apply(name, pct / 100.0)
+
+
 def _sw_reset(name: str) -> None:
-    """切回硬件通道时把 gamma 复位，避免软件调光叠加在硬件亮度上。"""
+    """切回硬件通道 / 撤销叠加时把 gamma 复位，避免软件层继续压暗。"""
     _run(["xrandr", "--output", name, "--brightness", "1.0"], 10)
+
+
+# 叠加层最多把白光压到 30%（gamma 1.0 → 0.30），对应的对比度损失见 README
+OVERLAY_DROP = 0.70
+
+
+def _overlay_gamma(extra: int) -> float:
+    """extra 0~100 → gamma 1.00~0.30。"""
+    extra = max(0, min(100, int(extra or 0)))
+    return round(1.0 - OVERLAY_DROP * extra / 100.0, 2)
+
+
+def _int_extra(st: dict) -> int:
+    try:
+        return max(0, min(100, int((st or {}).get("extra") or 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -417,9 +453,10 @@ MODE_LABEL = {
 def _entry(o: dict, details: dict, refresh: bool) -> dict:
     name = o["name"]
     o = dict(o, _details=details.get(name) or {})
-    mode, extra, note, reason, hint = _pick_mode(o)
+    mode, info, note, reason, hint = _pick_mode(o)
     stored = _stored().get(name) or {}
     value = None
+    fallback = None
 
     if mode == "ddc":
         if stored and not refresh and stored.get("mode") == "ddc":
@@ -430,12 +467,12 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
                 value = cached[0]
             else:
                 try:
-                    value, _max = _ddc_get(extra["ddc"]["bus"])
+                    value, _max = _ddc_get(info["ddc"]["bus"])
                     _VALUES[name] = (value, time.time())
                 except BrightError as e:
                     mode, reason, hint = "none", str(e), None
     elif mode == "backlight":
-        bl = extra["bl"]
+        bl = info["bl"]
         cur = bl["actual"] if bl["actual"] is not None else bl["cur"]
         value = None if cur is None else int(round(cur * 100.0 / bl["max"]))
     elif mode == "software":
@@ -444,25 +481,80 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         else:
             g = (details.get(name) or {}).get("brightness")
             value = None if g is None else int(round(g * 100))
+        if stored.get("mode") == "software" and stored.get("fallback"):
+            fallback = stored["fallback"]
 
     if value is None and stored and mode != "none":
         value = stored.get("value")
     if value is None and mode != "none":
         value = 100
+    if value is not None:
+        value = max(0, min(100, int(value)))
+
+    # 探测到的硬件能力（用于「下次是否重试硬件」）；mode 之后可能被回落改成 software
+    capability = mode
+    probe_value = value       # 硬件实际读到的值，回落时报告的实际通道值会覆盖 value
+
+    # 叠加层：只有硬件通道、且记录里的通道与当前探测一致时才回放
+    extra = 0
+    if mode in ("ddc", "backlight") and stored.get("mode") == mode:
+        extra = _int_extra(stored)
+        if value not in (None, 0):
+            extra = 0          # 硬件不在最低档，叠加本来就不生效，别在界面上暗示它在起作用
+
+    # 上一次硬件写失败、实际走软件 gamma 的屏：照实报告当前通道，别让界面以为还在硬件上
+    if mode in ("ddc", "backlight") and stored.get("fallback") \
+            and stored["fallback"].get("from") == mode:
+        fallback = stored["fallback"]
+        extra = 0
+        mode = "software"
+        value = stored.get("value") if stored.get("value") is not None else value
+
+    if mode == "none":
+        label, gamma = MODE_LABEL["none"], None
+    elif mode == "software":
+        gamma = None if value is None else round(value / 100.0, 2)
+        label = MODE_LABEL["software"] + ("（硬件写失败回落）" if fallback else "（纯软件）")
+        if fallback:
+            note = "硬件 %s 写失败，已回落软件调光%s：%s" % (
+                fallback.get("from") or "通道",
+                "" if gamma is None else "（gamma %.2f）" % gamma,
+                fallback.get("reason") or "未知原因")
+        elif not note:
+            note = "纯软件通道：gamma 直接压暗，亮度越低对比度越差"
+    else:
+        gamma = _overlay_gamma(extra)
+        if extra:
+            label = "%s + 软件叠加 %d%%" % (MODE_LABEL[mode], extra)
+            note = "硬件已到底（0%%）+ 软件叠加 %d%%：gamma %.2f，对比度约剩 %d%%" % (
+                extra, gamma, round(gamma * 100))
+        else:
+            label = MODE_LABEL[mode] + "（纯硬件）"
+            if value == 0:
+                note = "硬件已到最低 0%，还想更暗可拖动「软件叠加」（会压低对比度）"
+            elif note is None:
+                note = "纯硬件调节，gamma 1.00（对比度不受影响）"
 
     device = None
-    if mode == "ddc":
-        device = (extra.get("ddc") or {}).get("bus")
-    elif mode == "backlight":
-        device = (extra.get("bl") or {}).get("path")
+    if capability == "ddc":
+        device = (info.get("ddc") or {}).get("bus")
+    elif capability == "backlight":
+        device = (info.get("bl") or {}).get("path")
 
     return {
         "name": name,
         "mode": mode,
+        "capability": capability,
         "mode_label": MODE_LABEL[mode],
+        "label": label,
         "hardware": mode in ("ddc", "backlight"),
         "available": mode != "none",
-        "value": None if value is None else max(0, min(100, int(value))),
+        "value": value,
+        "probe_value": probe_value,
+        "extra": extra,
+        "gamma": gamma,
+        "overlay_ready": mode in ("ddc", "backlight") and value == 0,
+        "fallback": fallback,
         "enabled": bool(o.get("enabled")),
         "device": device,
         "note": note,
@@ -481,9 +573,12 @@ def summary(outputs: list[dict], details: dict | None = None, refresh: bool = Fa
             res[o["name"]] = _entry(o, details, refresh)
         except Exception as e:  # 单块屏探测失败不影响其它屏
             res[o["name"]] = {
-                "name": o["name"], "mode": "none", "mode_label": MODE_LABEL["none"],
-                "hardware": False, "available": False, "value": None,
-                "enabled": bool(o.get("enabled")), "device": None,
+                "name": o["name"], "mode": "none", "capability": "none",
+                "mode_label": MODE_LABEL["none"],
+                "label": MODE_LABEL["none"], "hardware": False, "available": False,
+                "value": None, "probe_value": None, "extra": 0, "gamma": None,
+                "overlay_ready": False,
+                "fallback": None, "enabled": bool(o.get("enabled")), "device": None,
                 "note": None, "reason": "探测异常：%s" % e, "hint": None,
             }
     return res
@@ -507,32 +602,31 @@ def _mode_changed(o: dict, details: dict) -> dict | None:
     典型场景：刚装好 ddcutil / 刚拿到 video 组权限，上次记录还是「软件调光 100%」。
     如果照旧下发，会把 100 硬写进硬件通道，屏幕突然跳到最亮。这里改成采纳硬件
     当前值（并落盘），返回变化摘要；没变化返回 None。
+
+    切到硬件通道时顺手把 gamma 复位，避免上一次的软件层（纯软件或叠加）留在硬件上。
     """
     st = _stored().get(o["name"]) or {}
     if not st:
         return None
     # refresh=True 才会真的去读硬件；否则 _entry 会直接回放记录里的旧值
     entry = _entry(o, details, refresh=True)
-    if entry["mode"] == "none" or st.get("mode") == entry["mode"]:
+    cap = entry.get("capability") or entry["mode"]
+    if cap == "none" or st.get("mode") == cap:
         return None
-    value = entry.get("value")
+    value = entry.get("probe_value") if cap in ("ddc", "backlight") else entry.get("value")
     stored_value = 100 if value is None else int(value)
-    _store(o["name"], stored_value, entry["mode"])
+    _store(o["name"], stored_value, cap, 0)
+    if cap in ("ddc", "backlight") and (
+            st.get("mode") == "software" or _int_extra(st)):
+        _sw_reset(o["name"])
+        _log("%s 切到 %s，gamma 复位 1.0（撤销上一次的软件层）" % (o["name"], cap))
     _log("%s 亮度通道 %s→%s，采用硬件当前值 %d%%（不下发旧值）"
-         % (o["name"], st.get("mode"), entry["mode"], stored_value))
-    return {"mode": entry["mode"], "value": stored_value, "prev": st.get("mode")}
+         % (o["name"], st.get("mode"), cap, stored_value))
+    return {"mode": cap, "value": stored_value, "prev": st.get("mode")}
 
 
-def set_value(o: dict, pct: int, details: dict | None = None) -> dict:
-    if not isinstance(pct, int) or not (0 <= pct <= 100):
-        raise BrightError("亮度必须是 0~100 的整数")
-    details = details if details is not None else _details()
-    entry = _entry(o, details, refresh=False)
-    mode = entry["mode"]
-    if mode == "none":
-        raise BrightError(entry["reason"] or "这块屏不支持亮度调节")
-
-    prev_mode = (_stored().get(o["name"]) or {}).get("mode")
+def _apply_main(o: dict, mode: str, pct: int, details: dict) -> None:
+    """下发主通道值（硬件 DDC / 硬件背光 / 纯软件 gamma）。"""
     if mode == "ddc":
         disp = _map_displays([o], {o["name"]: (details.get(o["name"]) or {}).get("edid")},
                              _ddc_state()["displays"]).get(o["name"])
@@ -548,12 +642,114 @@ def set_value(o: dict, pct: int, details: dict | None = None) -> dict:
     else:
         _sw_set(o["name"], pct)
 
+
+def _fallback_to_software(o: dict, pct: int, mode: str, details: dict,
+                          err: BrightError, hw_value) -> dict:
+    """硬件写失败：就地回落软件 gamma，并把原因写进记录，界面/CLI 明示。"""
+    try:
+        _sw_set(o["name"], pct)
+    except BrightError as e2:
+        raise BrightError("%s；软件回落也失败：%s" % (err, e2))
+    _store(o["name"], pct, "software", 0,
+           fallback={"from": mode, "reason": str(err), "hardware": hw_value,
+                     "time": datetime.now().strftime("%F %T")})
+    _log("%s %s 写失败（%s），已回落软件调光 %d%%" % (
+        o["name"], MODE_LABEL.get(mode, mode), err, pct))
+    return _entry(o, details, refresh=False)
+
+
+def set_value(o: dict, pct: int, details: dict | None = None,
+              extra: int | None = None) -> dict:
+    """设置亮度（0~100）。
+
+    extra 语义：None = 不改动已有的软件叠加（硬件回到非 0 时会自动撤销），
+    0~100 = 显式指定叠加值；只有硬件已经到 0 才生效，否则忽略并写日志。
+    """
+    if not isinstance(pct, int) or not (0 <= pct <= 100):
+        raise BrightError("亮度必须是 0~100 的整数")
+    if extra is not None and (not isinstance(extra, int) or not (0 <= extra <= 100)):
+        raise BrightError("软件叠加必须是 0~100 的整数")
+    details = details if details is not None else _details()
+    entry = _entry(o, details, refresh=False)
+    # 用「探测到的能力」决定怎么下发：上一次硬件写失败（当前 mode=software）时，
+    # 用户再拖一次应该重试硬件，而不是永久留在软件回落里。
+    mode = entry.get("capability") or entry["mode"]
+    if mode == "none":
+        raise BrightError(entry["reason"] or "这块屏不支持亮度调节")
+
+    stored = _stored().get(o["name"]) or {}
+    prev_mode = stored.get("mode")
+    prev_extra = _int_extra(stored)
+
+    try:
+        _apply_main(o, mode, pct, details)
+    except BrightError as e:
+        if mode == "software":          # 纯软件通道再回落就没得落了
+            raise
+        return _fallback_to_software(o, pct, mode, details, e, entry.get("value"))
+
+    # 从纯软件/回落通道切到硬件：先把上一次的软件 gamma 清掉（叠加层随后会重新下发）
     if prev_mode == "software" and mode != "software":
         _sw_reset(o["name"])
         _log("亮度通道从软件 gamma 切到 %s，已把 gamma 复位为 1.0" % mode)
 
-    _store(o["name"], pct, mode)
-    _log("亮度 %s = %d%%（%s）" % (o["name"], pct, mode))
+    # 叠加层：硬件通道、且主值在最低档（0）时才生效
+    new_extra = 0
+    if mode in ("ddc", "backlight"):
+        if extra is not None:
+            if pct == 0:
+                new_extra = extra
+            elif extra:
+                _log("%s 硬件亮度 %d%% 未到底，忽略软件叠加 %d%%"
+                     % (o["name"], pct, extra))
+        elif pct == 0 and prev_mode == mode:
+            new_extra = prev_extra
+
+    try:
+        if new_extra:
+            _sw_apply(o["name"], _overlay_gamma(new_extra))
+        elif mode in ("ddc", "backlight") and prev_extra and pct > 0:
+            _sw_reset(o["name"])
+            _log("%s 硬件亮度回到 %d%%，撤销软件叠加，gamma 复位 1.0" % (o["name"], pct))
+    except BrightError as e:
+        if extra:                       # 用户显式要叠加，失败必须让他看到
+            raise
+        _log("%s 恢复软件叠加失败（按无叠加处理）：%s" % (o["name"], e))
+        new_extra = 0
+
+    _store(o["name"], pct, mode, new_extra)
+    _log("亮度 %s = %d%%（%s%s）" % (
+        o["name"], pct, mode,
+        "，软件叠加 %d%%（gamma %.2f）" % (new_extra, _overlay_gamma(new_extra))
+        if new_extra else ""))
+    return _entry(o, details, refresh=False)
+
+
+def set_extra(o: dict, extra: int, details: dict | None = None) -> dict:
+    """只调软件叠加层（硬件必须已经在 0）。"""
+    if not isinstance(extra, int) or not (0 <= extra <= 100):
+        raise BrightError("软件叠加必须是 0~100 的整数")
+    details = details if details is not None else _details()
+    entry = _entry(o, details, refresh=False)
+    if entry["mode"] == "none":
+        raise BrightError(entry["reason"] or "这块屏不支持亮度调节")
+    if entry["mode"] == "software":
+        if entry.get("fallback"):
+            raise BrightError("%s 上一次硬件写失败，当前在软件回落通道；"
+                              "先拖一下主滑杆重试硬件，成功后才能叠加" % o["name"])
+        raise BrightError("%s 当前是纯软件调光，主滑杆本身就是 gamma，无需叠加"
+                          % o["name"])
+    if entry.get("value") not in (0, None):
+        raise BrightError("%s 硬件亮度还有 %s%%，先把主滑杆拖到 0 再叠加"
+                          % (o["name"], entry["value"]))
+    hw_value = 0 if entry.get("value") is None else int(entry["value"])
+    if extra:
+        _sw_apply(o["name"], _overlay_gamma(extra))
+    else:
+        _sw_reset(o["name"])
+    _store(o["name"], hw_value, entry["mode"], extra)
+    _log("%s 软件叠加 = %d%%（gamma %.2f，硬件 %d%%）"
+         % (o["name"], extra, _overlay_gamma(extra), hw_value))
     return _entry(o, details, refresh=False)
 
 
@@ -566,16 +762,18 @@ def reapply_for(o: dict) -> dict | None:
     if _mode_changed(o, details):
         return None
     try:
-        return set_value(o, int(st.get("value", 100)), details)
+        return set_value(o, int(st.get("value", 100)), details,
+                         extra=_int_extra(st))
     except BrightError as e:
         _log("重新应用 %s 亮度失败：%s" % (o["name"], e))
         return None
 
 
 def reapply_software() -> list[str]:
-    """任何 xrandr 布局变化都会把 gamma 复位；只给「软件调光」且已启用的屏重新下发。
+    """任何 xrandr 布局变化都会把 gamma 复位；给「软件调光」和「硬件 + 叠加」的屏重新下发。
 
-    硬件通道（DDC / 背光）不随布局变化，不必重发（DDC 单次上百毫秒，能省则省）。
+    硬件通道的主值（DDC / 背光）不随布局变化，不用重发（DDC 单次上百毫秒，能省则省），
+    但叠加层走的是 gamma，必须补回来，否则一次布局变化就把叠加花掉了。
     """
     try:
         import dm_core
@@ -588,15 +786,20 @@ def reapply_software() -> list[str]:
         if not o.get("enabled") or o.get("status") != "connected":
             continue
         st = _stored().get(o["name"])
-        if not st or st.get("mode") != "software":
+        if not st:
             continue
+        extra = _int_extra(st)
         try:
-            _sw_set(o["name"], int(st.get("value", 100)))
-            done.append(o["name"])
+            if st.get("mode") == "software":
+                _sw_set(o["name"], int(st.get("value", 100)))
+                done.append(o["name"])
+            elif extra:
+                _sw_apply(o["name"], _overlay_gamma(extra))
+                done.append("%s 叠加 %d%%" % (o["name"], extra))
         except BrightError as e:
-            _log("布局变化后恢复 %s 软件调光失败：%s" % (o["name"], e))
+            _log("布局变化后恢复 %s 软件层失败：%s" % (o["name"], e))
     if done:
-        _log("布局变化后重新应用软件调光: " + "，".join(done))
+        _log("布局变化后重新应用软件层: " + "，".join(done))
     return done
 
 
@@ -632,8 +835,11 @@ def apply_all() -> list[str]:
             continue
         try:
             r = set_value(dict(o, _details=details.get(o["name"]) or {}),
-                          int(st.get("value", 100)), details)
-            msgs.append("%s=%d%%(%s)" % (o["name"], r["value"], r["mode"]))
+                          int(st.get("value", 100)), details,
+                          extra=_int_extra(st))
+            msgs.append("%s=%d%%(%s%s)" % (
+                o["name"], r["value"], r["mode"],
+                "，叠加 %d%%" % r["extra"] if r.get("extra") else ""))
         except BrightError as e:
             msgs.append("%s 失败: %s" % (o["name"], e))
     if msgs:

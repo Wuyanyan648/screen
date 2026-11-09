@@ -12,6 +12,8 @@
     dm_cli.py brightness            列出每块屏的亮度与调光通道
     dm_cli.py brightness get  DP-0  读取某块屏当前亮度（硬件通道会实时读）
     dm_cli.py brightness set  DP-0 60   设置亮度（0-100）
+    dm_cli.py brightness set  DP-0 0 60 硬件到底后再叠 60% 软件 gamma
+    dm_cli.py brightness extra DP-0 60  只调软件叠加层（硬件必须已在 0）
     dm_cli.py log                   打印最近的操作日志
     dm_cli.py serve [--port N]      启动网页界面
 """
@@ -118,8 +120,10 @@ def brightness_cmd(args: list[str]) -> int:
             return 0
         for name, e in items.items():
             val = "-" if e["value"] is None else "%d%%" % e["value"]
+            if e.get("extra"):
+                val += " +%d%%" % e["extra"]
             extra = e.get("reason") or e.get("note") or ""
-            print("%-8s %-5s %-22s %s" % (name, val, e["mode_label"], extra))
+            print("%-8s %-8s %-22s %s" % (name, val, e.get("label") or e["mode_label"], extra))
             if e.get("hint"):
                 print("         需要权限: " + e["hint"].replace("\n", " && "))
         return 0
@@ -131,7 +135,9 @@ def brightness_cmd(args: list[str]) -> int:
         if not e:
             raise core.DMError("找不到输出 %s（或它没有连接）" % name)
         val = "-" if e["value"] is None else "%d%%" % e["value"]
-        print("%s 亮度 %s（%s）" % (name, val, e["mode_label"]))
+        if e.get("extra"):
+            val += " + 软件叠加 %d%%（gamma %s）" % (e["extra"], e.get("gamma"))
+        print("%s 亮度 %s（%s）" % (name, val, e.get("label") or e["mode_label"]))
         if e.get("reason"):
             print("原因: " + e["reason"])
         if e.get("hint"):
@@ -140,12 +146,26 @@ def brightness_cmd(args: list[str]) -> int:
 
     if sub == "set":
         if len(args) < 3:
-            raise core.DMError("用法: dm_cli.py brightness set <输出名> <0-100>")
-        r = core.set_brightness(args[1], args[2])
+            raise core.DMError("用法: dm_cli.py brightness set <输出名> <0-100> [叠加0-100]")
+        extra = None
+        if len(args) >= 4:
+            try:
+                extra = int(args[3])
+            except ValueError:
+                raise core.DMError("软件叠加必须是 0~100 的整数")
+        r = core.set_brightness(args[1], args[2], extra)
         print(r["message"])
         return 0
 
-    raise core.DMError("未知 brightness 子命令: %s（可用 list/get/set）" % sub)
+    if sub in ("extra", "stack"):
+        if len(args) < 3:
+            raise core.DMError("用法: dm_cli.py brightness extra <输出名> <0-100>"
+                               "（需硬件亮度已在 0）")
+        r = core.set_brightness_extra(args[1], args[2])
+        print(r["message"])
+        return 0
+
+    raise core.DMError("未知 brightness 子命令: %s（可用 list/get/set/extra）" % sub)
 
 
 if __name__ == "__main__":

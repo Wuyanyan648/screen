@@ -313,12 +313,47 @@ sudo usermod -aG video "$USER"     # 重新登录后生效
 没配权限时滑杆**不会失效**：外接屏和内屏都退到软件调光，卡片里写明
 「DDC 不可用：…」/「硬件背光 65%（只读，需 video 组权限）」。
 
+### 硬件到底后的软件叠加（2026-11-10）
+
+AOC 的 VCP 10 打到 0 后绝对亮度仍然偏高（压缩在显示器内部映射里，见上一节的实测）。
+所以硬件通道的卡片里多了一条「软件叠加」滑杆，两层可叠加，但优先级和可见性都写死：
+
+- **主调节永远是硬件**：上面那条滑杆走 DDC / 背光，gamma 保持 `1.00`，对比度不损失。
+- **只有硬件到 0 才能叠加**：主滑杆不在 0 时叠加滑杆禁用，后端也会拒绝并写日志
+  （`DP-0 硬件亮度 40% 未到底，忽略软件叠加 30%`），不会静默把对比度压下去。
+- **叠加是显式的**：`extra` 0~100，`gamma = 1 - 0.70 × extra / 100`（100 → 0.30）。
+- **可解释**：卡片标签直接显示三种状态之一 ——「硬件 DDC/CI（纯硬件）」、
+  「硬件 DDC/CI + 软件叠加 60%」、「软件调光（影响对比度）（纯软件）」；说明行写
+  「硬件已到底（0%）+ 软件叠加 60%：gamma 0.58，对比度约剩 58%」。
+- **可持久化**：`value` 与 `extra` 两路都写进缓存文件；服务重启、注销重登后先恢复硬件值，
+  再补叠加层（日志 `启动恢复亮度: DP-0=0%(ddc，叠加 60%)`）。任何 xrandr 布局变化都会
+  复位 gamma，`reapply_software()` 会把叠加层一并补回来（硬件主值不必重发）。
+- **不跳变**：叠加只动 gamma、不动硬件，拖动按 1% 一步下发；把主滑杆从 0 拖回非 0 时，
+  同一请求里先把 gamma 复位 `1.0`、撤销叠加，再设硬件值（只升 1%），
+  所以不会出现「叠加还在 + 硬件拉满」的突然变亮。
+- **降级**：硬件写失败时同一请求内回落软件 gamma，并标注原因 —— 标签
+  「软件调光（影响对比度）（硬件写失败回落）」，说明行写
+  「硬件 DDC/CI 写失败，已回落软件调光（gamma 0.30）：<原因>」。
+  再拖一次主滑杆会重试硬件，成功后回落记录自动清掉。
+
+本机结论（DP-0 / AOC U27G3X）：
+
+- **叠加模式下最低能压到**：硬件 0（VCP 10 = 0）+ `extra=100`（gamma 0.30），
+  即白光只剩原来的 30%，比之前「硬件 0 + gamma 1.0」再暗约 70%。
+- **对比度损失量级**：gamma 是整体乘性缩放，白场按比例下降、黑场由面板本底决定，
+  所以观感对比度大约等于「原生对比度 × gamma」——`extra=50`（gamma 0.65）约损失 35%，
+  `extra=100`（gamma 0.30）约损失 70%，暗部会明显发灰。建议只在夜间压到 40~70 之间。
+- **内屏**（DP-4 / eDP 背光）**走同一套逻辑**：重新登录拿到 `video` 组后通道变成
+  `硬件背光`，卡片同样出现叠加滑杆，硬件背光到 0 后可继续叠 gamma；
+  便携屏 HDMI-0 是纯软件通道，**不出现**叠加滑杆（主滑杆本身就是 gamma）。
+
 ### 通道切换时不沿用旧百分比
 
 记录里保存了上次的 `mode`。如果探测结果显示通道变了（例如刚装好 ddcutil，从「软件调光 100%」
 变成「硬件 DDC/CI」），启动时**不下发旧百分比**，而是采纳硬件当前值并落盘，日志写
 `DP-0 亮度通道 software→ddc，采用硬件当前值 0%（不下发旧值）`。
 否则会把 100 硬写进刚拿到的硬件通道，屏幕突然跳到最亮。代价是软件调光时期的百分比不会迁移过去。
+通道切换时 `extra` 一并清零，并把 gamma 复位 `1.0`，避免上次的软件叠加留在新通道上。
 
 ### 失败反馈
 
@@ -329,21 +364,28 @@ sudo usermod -aG video "$USER"     # 重新登录后生效
 
 ### 持久化与恢复
 
-- 位置：`~/.cache/display-manager.brightness.json`（每块屏最后一次的 `value` / `mode` / 时间）。
+- 位置：`~/.cache/display-manager.brightness.json`（每块屏最后一次的
+  `value` / `mode` / `extra` / 时间；`extra` 是硬件到底后的软件叠加层，0 表示不叠加）。
 - 服务启动 0.8 秒后由后台线程对**已启用**输出重新下发一次；屏是 `off` 时不应用。
 - 「关闭 → 开启」某块屏后，`on` 成功会立刻再应用一次上次的亮度（模式设置会复位 gamma）。
-- 通道从「软件调光」切到硬件时会把 gamma 复位为 1.0，避免双重压暗。
+- 通道从「软件调光」切到硬件时会把 gamma 复位为 1.0，避免双重压暗；叠加层按记录重放。
 
 ### API / CLI（门户后续可直接复用）
 
 ```bash
-curl -s http://127.0.0.1:8765/api/brightness          # 亮度总览
+curl -s http://127.0.0.1:8765/api/brightness          # 亮度总览（含 extra / gamma / label）
 curl -s -X POST -H 'Content-Type: application/json' \
      -d '{"name":"DP-0","value":60}' http://127.0.0.1:8765/api/brightness
+curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"name":"DP-0","value":0,"extra":60}' http://127.0.0.1:8765/api/brightness
+curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"name":"DP-0","extra":60}' http://127.0.0.1:8765/api/brightness   # 只改叠加
 
 python3 backend/dm_cli.py brightness                  # 每块屏的通道与当前值
 python3 backend/dm_cli.py brightness get  DP-0        # 走硬件通道时实时读
 python3 backend/dm_cli.py brightness set  DP-0 60     # 0~100
+python3 backend/dm_cli.py brightness set  DP-0 0 60   # 硬件 0 + 叠加 60
+python3 backend/dm_cli.py brightness extra DP-0 60    # 只改叠加（硬件必须已在 0）
 ```
 
 ### 验证记录（本机，2026-11-09）
@@ -367,6 +409,23 @@ python3 backend/dm_cli.py brightness set  DP-0 60     # 0~100
 - **本次修掉的解析缺陷**：`ddcutil detect` 的 `Invalid display` 段会重复打印
   `I2C bus / DRM connector / Model`，旧解析会把 AOC 的总线覆盖成便携屏的 `/dev/i2c-5`
   （结果：AOC 丢失、便携屏被误标成「硬件 DDC/CI」）。已按段切分修正。
+
+叠加通道验证（2026-11-10，DP-0 真机 + 假输出单元测试）：
+
+- `brightness extra DP-0 40` → 硬件 `getvcp 10` 仍是 `0`，`xrandr` gamma `0.72`；
+  `extra 100` → gamma `0.30`；`brightness set DP-0 5` → gamma 回 `1.0`、
+  `getvcp 10` 读回 `5`（叠加撤销、硬件主值生效）。
+- 「硬件没到底时叠加被丢弃」：`set 40 + extra 30` 实际只落 `40/extra=0`，日志
+  `硬件亮度 40% 未到底，忽略软件叠加 30%`。
+- 持久化：`set 0 60` 后重启服务，日志 `启动恢复亮度: DP-0=0%(ddc，叠加 60%)`，
+  gamma 仍是 `0.58`、VCP 10 仍是 `0`。
+- 无头浏览器 DOM：标签 `硬件 DDC/CI + 软件叠加 60%`，叠加行 `60% / gamma 0.58`；
+  纯软件/关闭的屏不渲染叠加行。
+- 函数级用例（临时 `DM_CACHE_DIR` + 打桩硬件）：叠加 40/60/100 的 gamma 与
+  对比度文本、硬件非 0 撤销叠加、纯软件屏拒绝叠加、硬件写失败回落
+  （`mode=software` + `fallback` 落盘 + 标签「硬件写失败回落」）、
+  再拖主滑杆重试硬件成功后清掉 `fallback`、重启时 `_mode_changed` 采纳硬件真实值
+  （用 `probe_value`，不会把回落时的 gamma 当硬件值写回）。
 
 ## 界面把自己的屏关掉了怎么救
 
@@ -638,7 +697,7 @@ systemctl show -p MemoryCurrent   15691776（15.0 MiB） / 14393344（13.7 MiB�
 | `~/.cache/display-manager.state` | 关闭前保存的四件套（模式/刷新率/transform/位置/primary） |
 | `~/.cache/display-manager.off` | 用户主动关闭的输出名单（供与看门狗共存、界面标注） |
 | `~/.cache/display-manager.log` | 操作日志（含 xrandr 原始 stderr、快捷键注册/触发） |
-| `~/.cache/display-manager.brightness.json` | 每块屏上次的亮度值与所用通道 |
+| `~/.cache/display-manager.brightness.json` | 每块屏上次的亮度值、通道与软件叠加层（`extra`） |
 | `~/.config/display-manager/config.json` | 闲置阈值（默认 300 秒，0 = 关闭提醒） |
 | `~/.config/systemd/user/screen-manager.service` | 8765 的用户单元（`install-autostart.sh` 生成） |
 | `~/.config/systemd/user/screen-portal.service` | 8760 门户的用户单元 |

@@ -104,6 +104,11 @@
     border:2px solid #0d1117}
   .slider:disabled{opacity:.45;cursor:not-allowed}
   .bnote{font-size:11px;color:var(--dim);line-height:1.55;margin-top:5px}
+  /* 软件叠加层（只在硬件通道出现，硬件到 0 后才可用） */
+  .bov{margin-top:7px;padding-top:6px;border-top:1px dotted var(--line)}
+  .bov .brightHead{font-size:11.5px}
+  .bovtag{font-size:10.5px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);
+    color:var(--dim);font-variant-numeric:tabular-nums}
   .bhint{font-size:11px;color:#ffd28a;margin-top:5px}
   .bhint summary{cursor:pointer;outline:none}
   .bhint summary:hover{text-decoration:underline}
@@ -581,7 +586,7 @@ function structuralSig(s){
     // 亮度只放「能力」相关字段；具体数值不进签名，拖动时不重建 DOM
     b: s.brightness ? Object.keys(s.brightness).sort().map(k=>{
       const b = s.brightness[k];
-      return [k, b.mode, b.available, b.mode_label, b.note, b.reason];
+      return [k, b.mode, b.available, b.mode_label, b.reason];
     }) : []
   });
 }
@@ -591,7 +596,8 @@ function render(force){
   $('#stamp').textContent = state.time;
   syncBrightSliders();
   const sig = structuralSig(state);
-  if(!force && sig === lastSig) return;
+  // 拖动亮度的瞬间不重建卡片，否则滑杆元素被替换，手柄会跳、拖动会断
+  if(!force && (sig === lastSig || brightDragging)) return;
   lastSig = sig;
   $('#canvasSize').textContent = fmtCanvas(state.canvas);
   $('#enabledCount').textContent = state.enabled_count;
@@ -615,12 +621,12 @@ function buildBright(o){
   const head = document.createElement('div');
   head.className = 'brightHead';
   const tagCls = b.mode === 'none' ? 'no' : (b.hardware ? 'hw' : 'sw');
-  head.innerHTML = `<span>亮度</span><b>${b.value === null ? '-' : b.value + '%'}</b>`
-                 + `<span class="btag ${tagCls}">${b.mode_label}</span>`;
+  head.innerHTML = `<span>亮度</span><b class="bval">${b.value === null ? '-' : b.value + '%'}</b>`
+                 + `<span class="btag ${tagCls}">${b.label || b.mode_label}</span>`;
   wrap.appendChild(head);
 
   const sl = document.createElement('input');
-  sl.type = 'range'; sl.className = 'slider';
+  sl.type = 'range'; sl.className = 'slider bmain';
   sl.min = 0; sl.max = 100; sl.step = 1;
   sl.value = b.value === null ? 100 : b.value;
   sl.disabled = !b.available;
@@ -629,7 +635,7 @@ function buildBright(o){
   sl.oninput = () => {
     brightDragging = o.name;
     brightDraft[o.name] = Number(sl.value);
-    head.querySelector('b').textContent = sl.value + '%';
+    head.querySelector('.bval').textContent = sl.value + '%';
     queueBright(o.name, Number(sl.value));
   };
   sl.onchange = () => {
@@ -639,9 +645,44 @@ function buildBright(o){
   sl.onclick = ev => ev.stopPropagation();
   wrap.appendChild(sl);
 
+  // 软件叠加：只在硬件通道出现。硬件没到 0 时禁用（后端同样会拒绝），
+  // 免得用户在还够暗的档位白白损失对比度。
+  if(b.hardware){
+    const ovwrap = document.createElement('div');
+    ovwrap.className = 'bov';
+    const ovhead = document.createElement('div');
+    ovhead.className = 'brightHead';
+    const g0 = (b.gamma === null || b.gamma === undefined) ? '-' : Number(b.gamma).toFixed(2);
+    ovhead.innerHTML = `<span>软件叠加</span><b class="bovval">${b.extra || 0}%</b>`
+      + `<span class="bovtag">gamma ${g0}</span>`;
+    ovwrap.appendChild(ovhead);
+
+    const ov = document.createElement('input');
+    ov.type = 'range'; ov.className = 'slider bovslider';
+    ov.min = 0; ov.max = 100; ov.step = 1;
+    ov.value = b.extra || 0;
+    ov.disabled = !b.overlay_ready;
+    ov.title = b.overlay_ready
+      ? '硬件已到底，继续用 gamma 压暗（对比度会下降）'
+      : '先把上面的亮度拖到 0 才能叠加';
+    ov.oninput = () => {
+      brightDragging = o.name;
+      brightDraft[o.name + '#extra'] = Number(ov.value);
+      ovhead.querySelector('.bovval').textContent = ov.value + '%';
+      queueBrightExtra(o.name, Number(ov.value));
+    };
+    ov.onchange = () => {
+      brightDragging = null;
+      sendBrightExtra(o.name, Number(ov.value));
+    };
+    ov.onclick = ev => ev.stopPropagation();
+    ovwrap.appendChild(ov);
+    wrap.appendChild(ovwrap);
+  }
+
   if(b.note){
     const n = document.createElement('div');
-    n.className = 'bnote';
+    n.className = 'bnote bdesc';
     n.textContent = b.note;
     wrap.appendChild(n);
   }
@@ -691,6 +732,16 @@ function queueBright(name, value){
   }, BRIGHT_THROTTLE_MS);
 }
 
+function queueBrightExtra(name, value){
+  const key = name + '#extra';
+  brightDraft[key] = value;
+  if(brightTimer[key]) return;
+  brightTimer[key] = setTimeout(() => {
+    brightTimer[key] = null;
+    sendBrightExtra(name, brightDraft[key]);
+  }, BRIGHT_THROTTLE_MS);
+}
+
 async function sendBright(name, value){
   const seq = (brightSeq[name] = (brightSeq[name] || 0) + 1);
   try{
@@ -707,12 +758,55 @@ async function sendBright(name, value){
   updateBrightText(name);
 }
 
+async function sendBrightExtra(name, value){
+  const key = name + '#extra';
+  const seq = (brightSeq[key] = (brightSeq[key] || 0) + 1);
+  try{
+    const r = await post('/api/brightness', {name, extra: value});
+    if(seq !== brightSeq[key]) return;
+    if(!r.ok) throw new Error(r.error || '设置失败');
+    if(state && state.brightness && r.brightness) state.brightness[name] = r.brightness;
+    delete brightErr[name];
+  }catch(e){
+    if(seq !== brightSeq[key]) return;
+    brightErr[name] = e.message;
+    toast(`软件叠加设置失败：${e.message}`, true);
+  }
+  updateBrightText(name);
+}
+
+// 亮度区动态字段统一在这里刷新：主值、通道标签（纯硬件 / 叠加 / 纯软件）、
+// 叠加滑杆可用性与 gamma、说明文字。不走整卡重建，拖动时手柄不会跳。
+function paintBright(wrap, b){
+  if(!b) return;
+  const val = wrap.querySelector('.bval');
+  if(val) val.textContent = b.value === null ? '-' : b.value + '%';
+  const tag = wrap.querySelector('.btag');
+  if(tag){
+    tag.textContent = b.label || b.mode_label;
+    tag.className = 'btag ' + (b.mode === 'none' ? 'no' : (b.hardware ? 'hw' : 'sw'));
+  }
+  const ov = wrap.querySelector('.bovslider');
+  if(ov){
+    ov.disabled = !b.overlay_ready;
+    if(Number(ov.value) !== Number(b.extra || 0)) ov.value = b.extra || 0;
+    ov.title = b.overlay_ready
+      ? '硬件已到底，继续用 gamma 压暗（对比度会下降）'
+      : '先把上面的亮度拖到 0 才能叠加';
+    const ovv = wrap.querySelector('.bovval');
+    if(ovv) ovv.textContent = (b.extra || 0) + '%';
+    const ovt = wrap.querySelector('.bovtag');
+    if(ovt) ovt.textContent = 'gamma ' + (b.gamma === null || b.gamma === undefined
+      ? '-' : Number(b.gamma).toFixed(2));
+  }
+  const desc = wrap.querySelector('.bdesc');
+  if(desc) desc.textContent = b.note || '';
+}
+
 function updateBrightText(name){
   const wrap = document.querySelector(`.bright[data-out="${name}"]`);
   if(!wrap) return;
-  const b = state && state.brightness && state.brightness[name];
-  const val = wrap.querySelector('b');
-  if(val && b) val.textContent = b.value === null ? '-' : b.value + '%';
+  paintBright(wrap, state && state.brightness && state.brightness[name]);
   wrap.querySelectorAll('.berr-js').forEach(el => el.remove());
   if(brightErr[name]){
     const e = document.createElement('div');
@@ -730,10 +824,9 @@ function syncBrightSliders(){
     if(brightDragging === name) return;
     const b = state.brightness[name];
     if(!b) return;
-    const sl = wrap.querySelector('input[type=range]');
+    const sl = wrap.querySelector('.bmain');
     if(sl && !sl.disabled && b.value !== null) sl.value = b.value;
-    const val = wrap.querySelector('b');
-    if(val) val.textContent = b.value === null ? '-' : b.value + '%';
+    paintBright(wrap, b);
   });
 }
 

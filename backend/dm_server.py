@@ -111,10 +111,14 @@ class Handler(SimpleHTTPRequestHandler):
                     if not name:
                         self._json({"ok": False, "error": "缺少输出名"}, 400)
                         return
-                    if "value" not in body:
+                    if "value" in body:
+                        # extra 可选：硬件到底（0）后叠加的软件层
+                        extra = body.get("extra") if "extra" in body else None
+                        self._json(core.set_brightness(name, body["value"], extra))
+                    elif "extra" in body:
+                        self._json(core.set_brightness_extra(name, body["extra"]))
+                    else:
                         self._json({"ok": False, "error": "缺少亮度值"}, 400)
-                        return
-                    self._json(core.set_brightness(name, body["value"]))
                 else:
                     self._json({"ok": False, "error": "未知接口"}, 404)
         except core.DMError as e:
