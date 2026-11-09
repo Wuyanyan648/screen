@@ -299,6 +299,7 @@ def snapshot() -> dict:
                 "at": metrics.get("at", 0.0),
                 "at_text": _now_text(metrics.get("at", 0.0)),
                 "window": PROBE_INTERVAL,
+                "peak_window": resource_monitor.PEAK_WINDOW,
                 "cpu_basis": "单核 100%",
                 "mem_total_bytes": resource_monitor.mem_total_bytes(),
                 "portal": metrics.get("portal"),
@@ -336,25 +337,31 @@ def metrics_cli(window: float = 1.2) -> int:
     total = meta["total"]
     win = meta["window"]
     print("资源占用（CPU 为最近 %.1f 秒均值，单核=100%%；内存为 cgroup memory.current / RSS）" % win)
-    print("%s %s %s  %s" % (_pad("服务", 36), _pad("CPU", 9), _pad("内存", 12), "来源"))
-    print("-" * 84)
+    print("%s %s %s %s  %s" % (_pad("服务", 36), _pad("CPU", 9), _pad("峰值", 9),
+                               _pad("内存", 12), "来源"))
+    print("-" * 94)
     rows = 0
     for svc in services:
         m = by_key.get(resource_monitor.service_key(svc)) or {}
         label = "%s (%s)" % (svc["name"], svc["unit"] or svc["id"])
         src = m.get("source_label") or m.get("reason") or "—"
-        print("%s %s %s  %s" % (_pad(label, 36), _pad(_fmt_pct(m.get("cpu_pct")), 9),
-                                _pad(_fmt_mb(m.get("mem_mb")), 12), src))
+        print("%s %s %s %s  %s" % (_pad(label, 36), _pad(_fmt_pct(m.get("cpu_pct")), 9),
+                                   _pad(_fmt_pct(m.get("cpu_peak")), 9),
+                                   _pad(_fmt_mb(m.get("mem_mb")), 12), src))
         rows += 1
     pm = meta.get("portal") or {}
-    print("-" * 84)
-    print("%s %s %s  %s" % (_pad("门户自身 (screen-portal.service)", 36),
-                            _pad(_fmt_pct(pm.get("cpu_pct")), 9),
-                            _pad(_fmt_mb(pm.get("mem_mb")), 12),
-                            pm.get("source_label") or pm.get("reason") or "—"))
-    print("%s %s %s  %s" % (_pad("合计（含门户自身）", 36), _pad(_fmt_pct(total.get("cpu_pct")), 9),
-                            _pad(_fmt_mb(total.get("mem_mb")), 12),
-                            "整机内存 %s" % _fmt_pct(total.get("mem_pct"))))
+    print("-" * 94)
+    print("%s %s %s %s  %s" % (_pad("门户自身 (screen-portal.service)", 36),
+                               _pad(_fmt_pct(pm.get("cpu_pct")), 9),
+                               _pad(_fmt_pct(pm.get("cpu_peak")), 9),
+                               _pad(_fmt_mb(pm.get("mem_mb")), 12),
+                               pm.get("source_label") or pm.get("reason") or "—"))
+    print("%s %s %s %s  %s" % (_pad("合计（含门户自身）", 36), _pad(_fmt_pct(total.get("cpu_pct")), 9),
+                               _pad(_fmt_pct(total.get("cpu_peak")), 9),
+                               _pad(_fmt_mb(total.get("mem_mb")), 12),
+                               "整机内存 %s" % _fmt_pct(total.get("mem_pct"))))
+    print("注：CLI 是独立进程，峰值列只覆盖本次两次采样；常驻服务的峰值窗口是最近 %d 分钟。"
+          % round(resource_monitor.PEAK_WINDOW / 60))
     return 0 if rows else 1
 
 

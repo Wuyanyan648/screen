@@ -154,7 +154,7 @@
   <div id="resSummary" class="resSummary" hidden>
     <span class="rlabel">资源占用</span>
     <span>CPU <b id="sumWin">5</b> 秒均值（单核 100%）</span>
-    <span>合计 CPU <b id="sumCpu">—</b></span>
+    <span>合计 CPU <b id="sumCpu">—</b><span id="sumPeakWrap" hidden> · 峰值 <b id="sumPeak">—</b></span></span>
     <span>内存 <b id="sumMem">—</b><span id="sumMemPct"></span></span>
     <span class="resNote" id="sumSelf"></span>
   </div>
@@ -195,6 +195,10 @@
   var RES_MEM_WARN = 512, RES_MEM_BAD = 1536;
   var SUM_CPU_WARN = 100, SUM_CPU_BAD = 200;
   var SUM_MEM_WARN = 1024, SUM_MEM_BAD = 2048;
+  // 峰值单独一套阈值：它是 5 分钟内单个 5 秒窗口的最高值，天然比均值高，
+  // 直接套均值阈值会长期满屏红。这里只在「曾经把一整个核跑满」时才提示。
+  var PEAK_CPU_WARN = 100, PEAK_CPU_BAD = 200;
+  var SUM_PEAK_CPU_WARN = 200, SUM_PEAK_CPU_BAD = 400;
 
   function $(id) { return document.getElementById(id); }
 
@@ -256,10 +260,14 @@
     var cpuItem = el("span");
     cpuItem.appendChild(document.createTextNode("CPU "));
     cpuItem.appendChild(el("b", "cpu", "—"));
+    var peakItem = el("span");
+    peakItem.appendChild(document.createTextNode("峰值 "));
+    peakItem.appendChild(el("b", "peak", "—"));
     var memItem = el("span");
     memItem.appendChild(document.createTextNode("内存 "));
     memItem.appendChild(el("b", "mem", "—"));
     resRow.appendChild(cpuItem);
+    resRow.appendChild(peakItem);
     resRow.appendChild(memItem);
     resRow.appendChild(el("span", "resNote", ""));
 
@@ -337,27 +345,36 @@
     // 资源占用：识别不到就是「—」，不写 0（0 会让人以为真的在跑但没占用）
     var m = s.metrics;
     var cpuB = card.querySelector("b.cpu");
+    var peakB = card.querySelector("b.peak");
     var memB = card.querySelector("b.mem");
     var resNote = card.querySelector(".resNote");
     if (cpuB) {
       var cpu = m && typeof m.cpu_pct === "number" ? m.cpu_pct : null;
+      var peak = m && typeof m.cpu_peak === "number" ? m.cpu_peak : null;
       var mem = m && typeof m.mem_mb === "number" ? m.mem_mb : null;
       cpuB.textContent = cpu === null ? "—" : cpu.toFixed(1) + "%";
+      peakB.textContent = peak === null ? "—" : peak.toFixed(1) + "%";
       memB.textContent = mem === null ? "—" : mem.toFixed(1) + " MB";
       cpuB.className = "cpu" + sevClass(cpu, RES_CPU_WARN, RES_CPU_BAD);
+      peakB.className = "peak" + sevClass(peak, PEAK_CPU_WARN, PEAK_CPU_BAD);
       memB.className = "mem" + sevClass(mem, RES_MEM_WARN, RES_MEM_BAD);
       var bits = [];
       if (m) {
         if (m.source === "cgroup") bits.push("5s 均值");
         else if (m.source) bits.push(m.source_label || m.source);
         if (m.cpu_window) bits.push("窗口 " + m.cpu_window + "s");
+        if (m.peak_window) bits.push("峰值 " + Math.round(m.peak_window / 60) + " 分钟滚动");
         if (typeof m.mem_pct === "number") bits.push("整机内存 " + m.mem_pct + "%");
         if (m.reason) bits.push(m.reason);
       } else {
         bits.push("未采集到指标（下一轮再看）");
       }
       resNote.textContent = bits.join(" · ");
-      resNote.title = m ? [m.detail, m.reason].filter(Boolean).join(" · ") : "";
+      var tip = [];
+      if (m && m.detail) tip.push(m.detail);
+      if (m && m.reason) tip.push(m.reason);
+      if (m && m.peak_samples) tip.push("峰值窗口内 " + m.peak_samples + " 个样本");
+      resNote.title = tip.join(" · ");
     }
 
     var last = card.querySelector(".lastAct");
@@ -419,12 +436,21 @@
     var total = mt.total || {};
     var pm = mt.portal || {};
     var cpu = typeof total.cpu_pct === "number" ? total.cpu_pct : null;
+    var peak = typeof total.cpu_peak === "number" ? total.cpu_peak : null;
     var mem = typeof total.mem_mb === "number" ? total.mem_mb : null;
     var c = $("sumCpu"), me = $("sumMem");
     c.textContent = cpu === null ? "—" : cpu.toFixed(1) + "%";
     me.textContent = mem === null ? "—" : mem.toFixed(1) + " MB";
     c.className = sevClass(cpu, SUM_CPU_WARN, SUM_CPU_BAD).trim();
     me.className = sevClass(mem, SUM_MEM_WARN, SUM_MEM_BAD).trim();
+    var pk = $("sumPeak");
+    pk.textContent = peak === null ? "—" : peak.toFixed(1) + "%";
+    pk.className = sevClass(peak, SUM_PEAK_CPU_WARN, SUM_PEAK_CPU_BAD).trim();
+    var pw = $("sumPeakWrap");
+    pw.hidden = (peak === null);
+    if (typeof total.peak_window === "number") {
+      pw.title = "最近 " + Math.round(total.peak_window / 60) + " 分钟内的最高值（合计口径）";
+    }
     $("sumMemPct").textContent = typeof total.mem_pct === "number" ? "（整机 " + total.mem_pct + "%）" : "";
     var self = $("sumSelf");
     var pCpu = typeof pm.cpu_pct === "number" ? pm.cpu_pct.toFixed(1) + "%" : "—";

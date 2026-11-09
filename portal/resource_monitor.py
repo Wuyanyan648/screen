@@ -23,6 +23,7 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 SYSTEMCTL = "/usr/bin/systemctl"
 RESOLVE_TTL = 60.0          # 单元 → cgroup 路径的缓存时间（路径出错会提前重查）
 MIN_WINDOW = 2.0            # 小于这个间隔不重算 CPU（避免手动刷新造成的尖峰）
+PEAK_WINDOW = 300.0         # CPU 峰值的滚动窗口：最近 5 分钟
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
@@ -68,6 +69,9 @@ def _metrics_empty(reason, source=None, label=""):
         "source": source,
         "source_label": label,
         "cpu_pct": None,
+        "cpu_peak": None,
+        "peak_window": PEAK_WINDOW,
+        "peak_samples": 0,
         "cpu_window": None,
         "mem_bytes": None,
         "mem_mb": None,
@@ -85,6 +89,9 @@ def _build(usage_usec, mem_bytes, window, source, label, detail, reason=""):
         "source": source,
         "source_label": label,
         "cpu_pct": round(usage_usec / (window * 1e6) * 100.0, 2) if (usage_usec is not None and window) else None,
+        "cpu_peak": None,
+        "peak_window": PEAK_WINDOW,
+        "peak_samples": 0,
         "cpu_window": round(window, 1) if window else None,
         "mem_bytes": mem_bytes,
         "mem_mb": mem_mb,
@@ -102,9 +109,39 @@ class Sampler:
         self._resolved = {}   # (manage, unit) -> {t, cg, pid, error}
         self._prev = {}       # key -> {usage, t, source}
         self._last = {}       # key -> metrics
+        self._series = {}     # key -> [(t, cpu_pct)]，只保留最近 PEAK_WINDOW 秒
         self.self_unit = self_unit
         self.self_manage = "user-unit"
         self.last_at = 0.0
+
+    # ---------- 峰值的滚动序列 ----------
+    def _push_series(self, key, cpu, window=PEAK_WINDOW):
+        """记一条样本并按窗口淘汰旧值；返回 (窗口内峰值, 样本数)。
+
+        cpu 为 None 时只做淘汰、不新增（采样失败不参与峰值，也不会把旧峰值清掉，
+        等它自然过期）。
+        """
+        now = time.time()
+        with self._lock:
+            arr = self._series.setdefault(key, [])
+            if cpu is not None:
+                arr.append((now, cpu))
+            cut = now - window
+            if arr and arr[0][0] < cut:
+                del arr[:next((i for i, (t, _) in enumerate(arr) if t >= cut), len(arr))]
+            if not arr:
+                return None, 0
+            return max(v for _, v in arr), len(arr)
+
+    def _total_block(self, by_key, portal):
+        """合计：均值 + 峰值（峰值取「同一轮各单元之和」的滚动最大值）。"""
+        items = list(by_key.values()) + [portal]
+        total = _total(items)
+        peak, n = self._push_series("__total__", total.get("cpu_pct"))
+        total["cpu_peak"] = round(peak, 2) if peak is not None else None
+        total["peak_window"] = PEAK_WINDOW
+        total["peak_samples"] = n
+        return total
 
     # ---------- 单元 → cgroup 路径 / 主进程 ----------
     def _resolve(self, manage, unit, force=False):
@@ -311,6 +348,10 @@ class Sampler:
             if old and old.get("cpu_pct") is not None and old.get("source") == source:
                 out["cpu_pct"] = old["cpu_pct"]
                 out["cpu_window"] = old["cpu_window"]
+        # 峰值只吃「本轮真正算出差值」的样本，沿用的旧值不再续命
+        peak, samples = self._push_series(key, out["cpu_pct"] if usage_delta is not None else None)
+        out["cpu_peak"] = round(peak, 2) if peak is not None else None
+        out["peak_samples"] = samples
         with self._lock:
             self._last[key] = out
         return out
@@ -332,7 +373,7 @@ class Sampler:
         except Exception as e:  # noqa: BLE001
             portal = _metrics_empty("采样异常: %r" % e)
         self.last_at = time.time()
-        return by_key, {"portal": portal, "total": _total(list(by_key.values()) + [portal])}
+        return by_key, {"portal": portal, "total": self._total_block(by_key, portal)}
 
     def sample_now(self, services, window=1.2):
         """CLI 用：现场采两次（默认间隔 1.2 秒）后返回结果，不依赖常驻服务。"""
@@ -347,7 +388,7 @@ class Sampler:
             by_key[key] = self._sample(svc.get("manage") or "external", svc.get("unit") or "",
                                        svc.get("process") or "", min_window=0.5, key=key)
         portal = self._sample(self.self_manage, self.self_unit, min_window=0.5, key="portal")
-        return by_key, {"portal": portal, "total": _total(list(by_key.values()) + [portal]),
+        return by_key, {"portal": portal, "total": self._total_block(by_key, portal),
                         "window": window}
 
 
