@@ -11,9 +11,9 @@
     dm_cli.py plan  HDMI-0          只看关闭后的后果，不动手
     dm_cli.py brightness            列出每块屏的亮度与调光通道
     dm_cli.py brightness get  DP-0  读取某块屏当前亮度（硬件通道会实时读）
-    dm_cli.py brightness set  DP-0 60   设置亮度（0-100）
-    dm_cli.py brightness set  DP-0 0 60 硬件到底后再叠 60% 软件 gamma
-    dm_cli.py brightness extra DP-0 60  只调软件叠加层（硬件必须已在 0）
+    dm_cli.py brightness set  DP-0 60   设置亮度（20-100，低于 20 会被拒绝）
+    dm_cli.py brightness set  DP-0 20 60 硬件到下限后再叠 60% 软件 gamma
+    dm_cli.py brightness extra DP-0 60  只调软件叠加层（硬件必须已在 20%）
     dm_cli.py brightness temp DP-0 4500 夜间色温（3000-6500K，6500 = 原生）
     dm_cli.py log                   打印最近的操作日志
     dm_cli.py serve [--port N]      启动网页界面
@@ -156,7 +156,8 @@ def brightness_cmd(args: list[str]) -> int:
 
     if sub == "set":
         if len(args) < 3:
-            raise core.DMError("用法: dm_cli.py brightness set <输出名> <0-100> [叠加0-100]")
+            raise core.DMError("用法: dm_cli.py brightness set <输出名> <20-100> [叠加0-100]"
+                               "（下限 20%%：再低在 SDR 下等于黑屏）")
         extra = None
         if len(args) >= 4:
             try:

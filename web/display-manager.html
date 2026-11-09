@@ -639,10 +639,12 @@ function buildBright(o){
 
   const sl = document.createElement('input');
   sl.type = 'range'; sl.className = 'slider bmain';
-  sl.min = 0; sl.max = 100; sl.step = 1;
-  sl.value = b.value === null ? 100 : b.value;
+  // 下限 20%：SDR 下再低等于黑屏（关掉 HDR 的 AOC 实测 0% 直接灰屏）。后端同样会拒绝。
+  const vmin = Number(b.min_value) || 20;
+  sl.min = vmin; sl.max = 100; sl.step = 1;
+  sl.value = b.value === null ? 100 : Math.max(vmin, b.value);
   sl.disabled = !b.available;
-  sl.title = b.available ? '拖动调节亮度（松手后立即生效）'
+  sl.title = b.available ? `拖动调节亮度（下限 ${vmin}%）`
                          : (b.reason || '这块屏不支持亮度调节');
   sl.oninput = () => {
     brightDragging = o.name;
@@ -657,8 +659,15 @@ function buildBright(o){
   sl.onclick = ev => ev.stopPropagation();
   wrap.appendChild(sl);
 
-  // 软件叠加：只在硬件通道出现。硬件没到 0 时禁用（后端同样会拒绝），
-  // 免得用户在还够暗的档位白白损失对比度。
+  if(b.available && b.floor_note){
+    const fn = document.createElement('div');
+    fn.className = 'bnote bfloor';
+    fn.textContent = b.floor_note;
+    wrap.appendChild(fn);
+  }
+
+  // 软件叠加：只在硬件通道出现。硬件没到下限时禁用（后端同样会拒绝），
+  // 免得用户在还够暗的档位白白损失对比度。上限受合成亮度下限约束。
   if(b.hardware){
     const ovwrap = document.createElement('div');
     ovwrap.className = 'bov';
@@ -669,14 +678,15 @@ function buildBright(o){
       + `<span class="bovtag">gamma ${g0}</span>`;
     ovwrap.appendChild(ovhead);
 
+    const cap = Number(b.overlay_cap);
     const ov = document.createElement('input');
     ov.type = 'range'; ov.className = 'slider bovslider';
-    ov.min = 0; ov.max = 100; ov.step = 1;
-    ov.value = b.extra || 0;
+    ov.min = 0; ov.max = Number.isFinite(cap) ? Math.max(0, cap) : 100; ov.step = 1;
+    ov.value = Math.min(b.extra || 0, ov.max);
     ov.disabled = !b.overlay_ready;
     ov.title = b.overlay_ready
-      ? '硬件已到底，继续用 gamma 压暗（对比度会下降）'
-      : '先把上面的亮度拖到 0 才能叠加';
+      ? `硬件已到下限，继续用 gamma 压暗（最多 ${ov.max}%，再高整体会低于 10%）`
+      : `先把上面的亮度拖到 ${vmin}% 才能叠加`;
     ov.oninput = () => {
       brightDragging = o.name;
       brightDraft[o.name + '#extra'] = Number(ov.value);
@@ -896,19 +906,31 @@ function paintBright(wrap, b){
     tag.textContent = b.label || b.mode_label;
     tag.className = 'btag ' + (b.mode === 'none' ? 'no' : (b.hardware ? 'hw' : 'sw'));
   }
+  const sl = wrap.querySelector('.bmain');
+  if(sl){
+    const vmin = Number(b.min_value) || 20;
+    sl.min = vmin;
+    if(b.value !== null && Number(sl.value) !== Math.max(vmin, b.value))
+      sl.value = Math.max(vmin, b.value);
+  }
   const ov = wrap.querySelector('.bovslider');
   if(ov){
+    const cap = Number(b.overlay_cap);
+    if(Number.isFinite(cap)) ov.max = Math.max(0, cap);
     ov.disabled = !b.overlay_ready;
-    if(Number(ov.value) !== Number(b.extra || 0)) ov.value = b.extra || 0;
+    const want = Math.min(b.extra || 0, ov.max);
+    if(Number(ov.value) !== Number(want)) ov.value = want;
     ov.title = b.overlay_ready
-      ? '硬件已到底，继续用 gamma 压暗（对比度会下降）'
-      : '先把上面的亮度拖到 0 才能叠加';
+      ? `硬件已到下限，继续用 gamma 压暗（最多 ${ov.max}%，再高整体会低于 10%）`
+      : `先把上面的亮度拖到 ${Number(b.min_value) || 20}% 才能叠加`;
     const ovv = wrap.querySelector('.bovval');
     if(ovv) ovv.textContent = (b.extra || 0) + '%';
     const ovt = wrap.querySelector('.bovtag');
     if(ovt) ovt.textContent = 'gamma ' + (b.gamma === null || b.gamma === undefined
       ? '-' : Number(b.gamma).toFixed(2));
   }
+  const fdesc = wrap.querySelector('.bfloor');
+  if(fdesc) fdesc.textContent = b.floor_note || '';
   const desc = wrap.querySelector('.bdesc');
   if(desc) desc.textContent = b.note || '';
   // 夜间色温区

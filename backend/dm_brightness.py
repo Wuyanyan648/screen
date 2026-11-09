@@ -451,11 +451,35 @@ def _sw_reset(name: str, temp: int | None = None) -> None:
 # 叠加层最多把白光压到 30%（gamma 1.0 → 0.30），对应的对比度损失见 README
 OVERLAY_DROP = 0.70
 
+# 亮度下限（百分比）。SDR 下再往下基本等于黑屏：2026-11-10 关掉 AOC 的 HDR 后，
+# DDC 写 0% 实测就是整块灰/黑，用户只能拿手机来中断操作。这里无条件限制——
+# OS 侧读不到显示器 OSD 的 HDR 状态（X11 无 HDR 通路，DDC capabilities 里也没有
+# 相关 feature），没法做「只有非 HDR 才限制」的判断。
+MIN_VALUE = 20
+# 硬件主值 × 叠加 gamma 的合成亮度下限（相对满亮度）。20% × 0.30 = 6% 太暗，
+# 所以叠加层按这个下限反推一个上限，保证「硬件 20 + 叠加 100」不会压到看不见。
+MIN_TOTAL = 0.10
+
 
 def _overlay_gamma(extra: int) -> float:
     """extra 0~100 → gamma 1.00~0.30。"""
     extra = max(0, min(100, int(extra or 0)))
     return round(1.0 - OVERLAY_DROP * extra / 100.0, 2)
+
+
+def _extra_cap(hw_pct) -> int:
+    """当前硬件主值下叠加层的上限，保证合成亮度不低于 MIN_TOTAL。
+
+    硬件 20% 时 gamma 最低只能到 0.50（额外叠加约 71%），再低整体就 <10% 了。
+    """
+    try:
+        v = max(MIN_VALUE, min(100, int(hw_pct if hw_pct is not None else 100))) / 100.0
+    except (TypeError, ValueError):
+        v = 1.0
+    gmin = MIN_TOTAL / v
+    if gmin >= 1.0:
+        return 0
+    return max(0, min(100, int((1.0 - gmin) / OVERLAY_DROP * 100)))
 
 
 def _int_extra(st: dict) -> int:
@@ -622,12 +646,18 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         temp_note = ("%dK → gamma %s（只改 R/G/B 比例，对比度影响很小）"
                      % (temp, _gamma_arg(temp)))
 
-    # 叠加层：只有硬件通道、且记录里的通道与当前探测一致时才回放
+    # 叠加层：只有硬件通道、记录里的通道与当前探测一致、且主值在最低档时才回放
     extra = 0
+    extra_cap = _extra_cap(value)
     if mode in ("ddc", "backlight") and stored.get("mode") == mode:
         extra = _int_extra(stored)
-        if value not in (None, 0):
+        if value is not None and value > MIN_VALUE:
             extra = 0          # 硬件不在最低档，叠加本来就不生效，别在界面上暗示它在起作用
+        elif extra > extra_cap:
+            note = "叠加 %d%% 会把整体压到 %.0f%%（低于 %d%% 下限），已按 %d%% 生效" % (
+                extra, (MIN_VALUE / 100.0) * _overlay_gamma(extra) * 100,
+                MIN_TOTAL * 100, extra_cap)
+            extra = extra_cap
 
     # 上一次硬件写失败、实际走软件 gamma 的屏：照实报告当前通道，别让界面以为还在硬件上
     if mode in ("ddc", "backlight") and stored.get("fallback") \
@@ -653,12 +683,13 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         gamma = _overlay_gamma(extra)
         if extra:
             label = "%s + 软件叠加 %d%%" % (MODE_LABEL[mode], extra)
-            note = "硬件已到底（0%%）+ 软件叠加 %d%%：gamma %.2f，对比度约剩 %d%%" % (
-                extra, gamma, round(gamma * 100))
+            note = "硬件已到下限（%d%%）+ 软件叠加 %d%%：gamma %.2f，对比度约剩 %d%%%s" % (
+                MIN_VALUE, extra, gamma, round(gamma * 100),
+                "" if not note else "；" + note)
         else:
             label = MODE_LABEL[mode] + "（纯硬件）"
-            if value == 0:
-                note = "硬件已到最低 0%，还想更暗可拖动「软件叠加」（会压低对比度）"
+            if value is not None and value <= MIN_VALUE:
+                note = "硬件已到下限 %d%%，还想更暗可拖动「软件叠加」（会压低对比度）" % MIN_VALUE
             elif note is None:
                 note = "纯硬件调节，不压 gamma（对比度不受影响）"
 
@@ -680,7 +711,11 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         "probe_value": probe_value,
         "extra": extra,
         "gamma": gamma,
-        "overlay_ready": mode in ("ddc", "backlight") and value == 0,
+        "overlay_ready": mode in ("ddc", "backlight")
+                          and value is not None and value <= MIN_VALUE,
+        "overlay_cap": extra_cap,
+        "min_value": MIN_VALUE,
+        "floor_note": "下限 %d%%：再低在 SDR 下等于黑屏（HDR 关闭后实测）" % MIN_VALUE,
         "temp": temp,
         "temp_label": "%dK" % temp if temp != TEMP_MAX else "6500K（原生）",
         "temp_gamma": list(_temp_gamma(temp)),
@@ -710,7 +745,9 @@ def summary(outputs: list[dict], details: dict | None = None, refresh: bool = Fa
                 "mode_label": MODE_LABEL["none"],
                 "label": MODE_LABEL["none"], "hardware": False, "available": False,
                 "value": None, "probe_value": None, "extra": 0, "gamma": None,
-                "overlay_ready": False,
+                "overlay_ready": False, "overlay_cap": 0,
+                "min_value": MIN_VALUE,
+                "floor_note": "下限 %d%%：再低在 SDR 下等于黑屏（HDR 关闭后实测）" % MIN_VALUE,
                 "temp": TEMP_MAX, "temp_label": "6500K（原生）",
                 "temp_gamma": [1.0, 1.0, 1.0], "temp_ready": False,
                 "temp_note": None, "night_light": _night_light_cached(),
@@ -751,6 +788,14 @@ def _mode_changed(o: dict, details: dict) -> dict | None:
         return None
     value = entry.get("probe_value") if cap in ("ddc", "backlight") else entry.get("value")
     stored_value = 100 if value is None else int(value)
+    if stored_value < MIN_VALUE:
+        # 采纳硬件当前值，但不能把屏幕留在下限以下（HDR 关掉后 0% 就是黑屏）
+        _log("%s 硬件当前 %d%% 低于下限，抬到 %d%%" % (o["name"], stored_value, MIN_VALUE))
+        stored_value = MIN_VALUE
+        try:
+            _apply_main(o, cap, stored_value, details)
+        except BrightError as e:
+            _log("%s 抬升到下限 %d%% 失败：%s" % (o["name"], MIN_VALUE, e))
     _store(o["name"], stored_value, cap, 0)
     if cap in ("ddc", "backlight") and (
             st.get("mode") == "software" or _int_extra(st)):
@@ -762,21 +807,102 @@ def _mode_changed(o: dict, details: dict) -> dict | None:
 
 
 def _apply_main(o: dict, mode: str, pct: int, details: dict) -> None:
-    """下发主通道值（硬件 DDC / 硬件背光 / 纯软件 gamma）。"""
+    """下发主通道值（硬件 DDC / 硬件背光 / 纯软件 gamma）。
+
+    硬件两条通道写完都读回校验：面板固件可能收下指令却不改值（AOC 关 HDR 后
+    就出现过整条 DDC 写不进去的情况），只发不验会让界面显示「已设置」而屏幕没动。
+    读回不一致时在同一次调用里还原上一值，并把还原结果写进异常信息。
+    """
     if mode == "ddc":
         disp = _map_displays([o], {o["name"]: (details.get(o["name"]) or {}).get("edid")},
                              _ddc_state()["displays"]).get(o["name"])
         if not disp or not disp.get("bus"):
             raise BrightError("没找到 %s 对应的 ddcutil 显示器编号" % o["name"])
-        _ddc_set(disp["bus"], pct)
+        bus = disp["bus"]
+        before = None
+        try:
+            before, _mx = _ddc_get(bus)
+        except BrightError:
+            before = None                 # 读不到就算了，后面按「未知原值」处理
+        try:
+            _ddc_set(bus, pct)
+        except BrightError as e:
+            cur = _ddc_quiet(bus)
+            if before is not None and cur is not None and cur != before:
+                raise BrightError("%s；读回 %d%%，%s" % (e, cur, _ddc_restore(bus, before)))
+            raise
+        got = _ddc_quiet(bus)
+        if got is None:
+            raise BrightError("DDC 写入后读回超时（目标 %d%%），无法确认是否生效" % pct)
+        if got != pct:
+            raise BrightError("DDC 写入后读回 %d%%（目标 %d%%），写入被忽略；%s"
+                              % (got, pct, _ddc_restore(bus, before)))
         _VALUES[o["name"]] = (pct, time.time())
     elif mode == "backlight":
         bl = backlight_info()
         if not bl:
             raise BrightError("没有可用的 /sys/class/backlight 设备")
+        raw_before = bl.get("cur")
+        before = (int(round(raw_before * 100.0 / bl["max"]))
+                  if raw_before is not None else None)
         _backlight_set(bl, pct)
+        got = _backlight_read(bl)
+        if got is None:
+            raise BrightError("背光写入后读回超时（目标 %d%%），无法确认是否生效" % pct)
+        if got != pct:
+            raise BrightError("背光写入后读回 %d%%（目标 %d%%）；%s"
+                              % (got, pct, _backlight_restore(bl, before)))
     else:
         _sw_set(o["name"], pct)
+
+
+def _ddc_quiet(bus: str) -> int | None:
+    """读回当前亮度，失败返回 None（用于校验，不再抛异常）。"""
+    try:
+        cur, _mx = _ddc_get(bus)
+        return cur
+    except BrightError:
+        return None
+
+
+def _ddc_restore(bus: str, before: int | None) -> str:
+    if before is None:
+        return "原值未知，未做还原"
+    if _ddc_set_quiet(bus, before):
+        return "已还原为 %d%%" % before
+    return "还原为 %d%% 也失败（屏幕可能仍停在写入后的状态）" % before
+
+
+def _ddc_set_quiet(bus: str, pct: int) -> bool:
+    try:
+        _ddc_set(bus, pct)
+        return True
+    except BrightError:
+        return False
+
+
+def _backlight_read(bl: dict) -> int | None:
+    """读回背光百分比；nvidia 驱动偶尔要等一拍，最多重试 3 次。"""
+    for i in range(3):
+        try:
+            with open(bl["path"]) as f:
+                raw = int(f.read().strip())
+            return int(round(raw * 100.0 / bl["max"]))
+        except (OSError, ValueError):
+            pass
+        if i < 2:
+            time.sleep(0.1)
+    return None
+
+
+def _backlight_restore(bl: dict, before: int | None) -> str:
+    if before is None:
+        return "原值未知，未做还原"
+    try:
+        _backlight_set(bl, int(before))
+        return "已还原为 %d%%" % before
+    except BrightError as e:
+        return "还原为 %d%% 也失败：%s" % (before, e)
 
 
 def _fallback_to_software(o: dict, pct: int, mode: str, details: dict,
@@ -795,14 +921,22 @@ def _fallback_to_software(o: dict, pct: int, mode: str, details: dict,
 
 
 def set_value(o: dict, pct: int, details: dict | None = None,
-              extra: int | None = None) -> dict:
-    """设置亮度（0~100）。
+              extra: int | None = None, allow_clamp: bool = False) -> dict:
+    """设置亮度（MIN_VALUE~100）。
 
-    extra 语义：None = 不改动已有的软件叠加（硬件回到非 0 时会自动撤销），
-    0~100 = 显式指定叠加值；只有硬件已经到 0 才生效，否则忽略并写日志。
+    extra 语义：None = 不改动已有的软件叠加（硬件回到非最低档时会自动撤销），
+    0~100 = 显式指定叠加值；只有硬件已经到下限 MIN_VALUE 才生效，否则忽略并写日志。
+    allow_clamp=True 只给启动/重登的恢复路径用：历史记录里可能存着低于下限的值
+    （HDR 关闭前 0% 并不黑），那时抬到 MIN_VALUE 并记日志，而不是报错。
     """
     if not isinstance(pct, int) or not (0 <= pct <= 100):
         raise BrightError("亮度必须是 0~100 的整数")
+    if pct < MIN_VALUE:
+        if not allow_clamp:
+            raise BrightError(
+                "亮度不能低于 %d%%：SDR 下再低等于黑屏（当前请求 %d%%）" % (MIN_VALUE, pct))
+        _log("%s 历史亮度 %d%% 低于下限，按 %d%% 抬升后下发" % (o["name"], pct, MIN_VALUE))
+        pct = MIN_VALUE
     if extra is not None and (not isinstance(extra, int) or not (0 <= extra <= 100)):
         raise BrightError("软件叠加必须是 0~100 的整数")
     details = details if details is not None else _details()
@@ -829,22 +963,26 @@ def set_value(o: dict, pct: int, details: dict | None = None,
         _sw_reset(o["name"])
         _log("亮度通道从软件 gamma 切到 %s，已把 gamma 复位为 1.0" % mode)
 
-    # 叠加层：硬件通道、且主值在最低档（0）时才生效
+    # 叠加层：硬件通道、且主值已在最低档（MIN_VALUE）时才生效
     new_extra = 0
+    extra_cap = _extra_cap(pct)
     if mode in ("ddc", "backlight"):
         if extra is not None:
-            if pct == 0:
-                new_extra = extra
+            if pct <= MIN_VALUE:
+                new_extra = min(extra, extra_cap)
+                if new_extra != extra:
+                    _log("%s 硬件 %d%% 下叠加最多 %d%%（再高整体低于 %d%%），%d%% 按 %d%% 生效"
+                         % (o["name"], pct, extra_cap, MIN_TOTAL * 100, extra, new_extra))
             elif extra:
-                _log("%s 硬件亮度 %d%% 未到底，忽略软件叠加 %d%%"
+                _log("%s 硬件亮度 %d%% 未到下限，忽略软件叠加 %d%%"
                      % (o["name"], pct, extra))
-        elif pct == 0 and prev_mode == mode:
-            new_extra = prev_extra
+        elif pct <= MIN_VALUE and prev_mode == mode:
+            new_extra = min(prev_extra, extra_cap)
 
     try:
         if new_extra:
             _sw_apply(o["name"], _overlay_gamma(new_extra))
-        elif mode in ("ddc", "backlight") and prev_extra and pct > 0:
+        elif mode in ("ddc", "backlight") and prev_extra and pct > MIN_VALUE:
             _sw_reset(o["name"])
             _log("%s 硬件亮度回到 %d%%，撤销软件叠加，gamma 复位 1.0" % (o["name"], pct))
     except BrightError as e:
@@ -862,7 +1000,7 @@ def set_value(o: dict, pct: int, details: dict | None = None,
 
 
 def set_extra(o: dict, extra: int, details: dict | None = None) -> dict:
-    """只调软件叠加层（硬件必须已经在 0）。"""
+    """只调软件叠加层（硬件必须已经在最低档 MIN_VALUE）。"""
     if not isinstance(extra, int) or not (0 <= extra <= 100):
         raise BrightError("软件叠加必须是 0~100 的整数")
     details = details if details is not None else _details()
@@ -875,10 +1013,15 @@ def set_extra(o: dict, extra: int, details: dict | None = None) -> dict:
                               "先拖一下主滑杆重试硬件，成功后才能叠加" % o["name"])
         raise BrightError("%s 当前是纯软件调光，主滑杆本身就是 gamma，无需叠加"
                           % o["name"])
-    if entry.get("value") not in (0, None):
-        raise BrightError("%s 硬件亮度还有 %s%%，先把主滑杆拖到 0 再叠加"
-                          % (o["name"], entry["value"]))
-    hw_value = 0 if entry.get("value") is None else int(entry["value"])
+    hw_value = MIN_VALUE if entry.get("value") is None else int(entry["value"])
+    if hw_value > MIN_VALUE:
+        raise BrightError("%s 硬件亮度还有 %d%%，先把主滑杆拖到 %d%% 再叠加"
+                          % (o["name"], hw_value, MIN_VALUE))
+    cap = _extra_cap(hw_value)
+    if extra > cap:
+        _log("%s 硬件 %d%% 下叠加最多 %d%%（再高整体低于 %d%%），%d%% 按 %d%% 生效"
+             % (o["name"], hw_value, cap, MIN_TOTAL * 100, extra, cap))
+        extra = cap
     if extra:
         _sw_apply(o["name"], _overlay_gamma(extra))
     else:
@@ -925,7 +1068,7 @@ def reapply_for(o: dict) -> dict | None:
         return None
     try:
         return set_value(o, int(st.get("value", 100)), details,
-                         extra=_int_extra(st))
+                         extra=_int_extra(st), allow_clamp=True)
     except BrightError as e:
         _log("重新应用 %s 亮度失败：%s" % (o["name"], e))
         return None
@@ -952,12 +1095,22 @@ def reapply_software() -> list[str]:
             continue
         extra = _int_extra(st)
         temp = _int_temp(st)
+        raw = int(st.get("value", 100))
+        val = max(MIN_VALUE, min(100, raw))
+        if val != raw:
+            _log("%s 历史亮度 %d%% 低于下限，按 %d%% 恢复" % (o["name"], raw, val))
+            _store(o["name"], val, st.get("mode") or "software", extra, temp=temp)
+        cap = _extra_cap(val)
+        if extra > cap:
+            _log("%s 硬件 %d%% 下叠加上限 %d%%，%d%% 按 %d%% 恢复"
+                 % (o["name"], val, cap, extra, cap))
+            extra = cap
+            _store(o["name"], val, st.get("mode") or "software", extra, temp=temp)
         try:
             if st.get("mode") == "software":
-                _sw_set(o["name"], int(st.get("value", 100)), temp)
+                _sw_set(o["name"], val, temp)
                 done.append("%s %d%%%s" % (
-                    o["name"], int(st.get("value", 100)),
-                    "，%dK" % temp if temp != TEMP_MAX else ""))
+                    o["name"], val, "，%dK" % temp if temp != TEMP_MAX else ""))
             elif extra:
                 _sw_apply(o["name"], _overlay_gamma(extra), temp)
                 done.append("%s 叠加 %d%%%s" % (
@@ -1005,7 +1158,7 @@ def apply_all() -> list[str]:
         try:
             r = set_value(dict(o, _details=details.get(o["name"]) or {}),
                           int(st.get("value", 100)), details,
-                          extra=_int_extra(st))
+                          extra=_int_extra(st), allow_clamp=True)
             msgs.append("%s=%d%%(%s%s%s)" % (
                 o["name"], r["value"], r["mode"],
                 "，叠加 %d%%" % r["extra"] if r.get("extra") else "",

@@ -622,16 +622,22 @@ def turn_on(name: str, reason: str = "cli") -> dict:
 
 
 def set_brightness(name: str, value, extra=None) -> dict:
-    """设置亮度（0~100）。通道选择见 dm_brightness.py：硬件背光/DDC 优先，其次软件调光。
+    """设置亮度（20~100）。通道选择见 dm_brightness.py：硬件背光/DDC 优先，其次软件调光。
 
-    extra 是硬件到底（0）后的软件叠加层 0~100；None 表示不改动已有叠加。
+    下限 20% 是无条件的安全线：SDR 下再低基本等于黑屏（关掉 HDR 的 AOC 实测 0% 直接
+    灰屏）。OS 侧读不到显示器 OSD 的 HDR 状态，所以不做「只有非 HDR 才限制」的判断。
+    extra 是硬件到下限后的软件叠加层 0~100；None 表示不改动已有叠加。
     """
+    import dm_brightness
     try:
         v = int(value)
     except (TypeError, ValueError):
-        raise DMError("亮度必须是 0~100 的整数")
+        raise DMError("亮度必须是 %d~100 的整数" % dm_brightness.MIN_VALUE)
     if not 0 <= v <= 100:
         raise DMError("亮度必须在 0~100 之间")
+    if v < dm_brightness.MIN_VALUE:
+        raise DMError("亮度不能低于 %d%%：SDR 下再低等于黑屏（当前请求 %d%%）"
+                      % (dm_brightness.MIN_VALUE, v))
     if extra is not None:
         try:
             extra = int(extra)
@@ -645,7 +651,6 @@ def set_brightness(name: str, value, extra=None) -> dict:
     if not o["connected"]:
         raise DMError("%s 当前不是 connected（%s）" % (name, o["status"]))
 
-    import dm_brightness
     try:
         entry = dm_brightness.set_value(o, v, extra=extra)
     except dm_brightness.BrightError as e:
@@ -656,7 +661,11 @@ def set_brightness(name: str, value, extra=None) -> dict:
 
 
 def set_brightness_extra(name: str, extra) -> dict:
-    """只调软件叠加层（硬件必须已经在 0）。"""
+    """只调软件叠加层（硬件必须已经在最低档 20%）。
+
+    叠加值会被合成下限（MIN_TOTAL）截断，见 dm_brightness._extra_cap；
+    返回的 entry["extra"] 才是真正生效的值。
+    """
     try:
         x = int(extra)
     except (TypeError, ValueError):
