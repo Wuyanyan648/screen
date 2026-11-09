@@ -7,7 +7,9 @@
 - 状态由**后端**定时探测：每个服务一个线程，urllib 请求 + 1.5 秒超时；
 - 浏览器只读 /api/status，不直接访问被管理的服务，避免 CORS / 代理干扰；
 - 启停只是 systemctl 薄壳（/api/action）：user-unit 加 --user，system-unit 走系统管理器；
-  门户不负责清理，注销/关机时由 systemd 会话管理器统一停止受管服务。
+  门户不负责清理，注销/关机时由 systemd 会话管理器统一停止受管服务；
+- CPU / 内存按 cgroup 采样（resource_monitor.py），与探测同一个 5 秒节奏，
+  `/api/status` 里带 metrics；命令行用 `python3 portal_server.py --metrics` 直接打印。
 
 只用 Python 标准库。
 """
@@ -25,23 +27,27 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+import resource_monitor
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(ROOT, "web")
 CONFIG_PATH = os.path.join(ROOT, "services.json")
 
 DEFAULT_PORT = 8760
-PROBE_INTERVAL = 5.0   # 后端探测周期（秒）
+PROBE_INTERVAL = 5.0   # 后端探测周期（秒）= CPU 均值窗口
 PROBE_TIMEOUT = 1.5    # 单次 HTTP 探测超时（秒）
 USER_AGENT = "local-service-portal/1.0"
 
 _LOCK = threading.Lock()
 _PROBE_LOCK = threading.Lock()   # 串行化探测，避免定时轮与「立即检测」交叉
+_SAMPLER = resource_monitor.Sampler()   # 资源占用采样（cgroup 直读 + 降级）
 _STATE = {
     "services": [],       # 每项 = 配置字段 + status/latency_ms/last_checked/http_status/error/unit_state
     "mtime": 0.0,
     "checked_at": 0.0,
     "config_error": "",
     "actions": {},        # id -> {verb, ok, message, at, at_text}
+    "metrics": {},        # {"by_key": {...}, "portal": {...}, "total": {...}, "at": ts}
 }
 
 
@@ -105,6 +111,8 @@ def _normalize(raw: dict) -> list[dict]:
             # 托管方式：user-unit / system-unit / external（只展示）
             "manage": manage,
             "unit": str(item.get("unit") or ""),
+            # 外部服务没有 systemd 单元时，用它按进程名估资源占用
+            "process": str(item.get("process") or ""),
             "note": str(item.get("note") or ""),
             "start_on_login": bool(item.get("start_on_login", manage != "external")),
             "unit_state": "",
@@ -114,6 +122,7 @@ def _normalize(raw: dict) -> list[dict]:
             "last_checked_text": "",
             "http_status": None,
             "error": "",
+            "metrics": None,
         })
     return services
 
@@ -247,6 +256,13 @@ def probe_round() -> None:
                 if hit:
                     svc.update(hit)
             _STATE["checked_at"] = now
+        # 资源占用：与探测同一节奏采样，CPU 窗口≈探测周期，不需要额外定时器
+        try:
+            by_key, meta = _SAMPLER.poll(services)
+            with _LOCK:
+                _STATE["metrics"] = dict(meta, by_key=by_key, at=now)
+        except Exception as e:  # noqa: BLE001 —— 采样失败只让指标显示「—」
+            print("[portal] 资源采样异常: %r" % e, file=sys.stderr)
 
 
 def probe_loop() -> None:
@@ -262,10 +278,13 @@ def probe_loop() -> None:
 def snapshot() -> dict:
     with _LOCK:
         checked = _STATE["checked_at"]
+        metrics = _STATE["metrics"] or {}
+        by_key = metrics.get("by_key") or {}
         services = []
         for s in _STATE["services"]:
             item = dict(s)
             item["last_action"] = _STATE["actions"].get(s["id"])
+            item["metrics"] = by_key.get(resource_monitor.service_key(s))
             services.append(item)
         return {
             "ok": True,
@@ -276,7 +295,67 @@ def snapshot() -> dict:
             "checked_text": _now_text(checked),
             "config_error": _STATE["config_error"],
             "services": services,
+            "metrics": {
+                "at": metrics.get("at", 0.0),
+                "at_text": _now_text(metrics.get("at", 0.0)),
+                "window": PROBE_INTERVAL,
+                "cpu_basis": "单核 100%",
+                "mem_total_bytes": resource_monitor.mem_total_bytes(),
+                "portal": metrics.get("portal"),
+                "total": metrics.get("total"),
+            },
         }
+
+
+def _width(text: str) -> int:
+    """终端显示宽度：CJK 字符按 2 列算，用来对齐中文名。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - _width(text))
+
+
+def _fmt_pct(v) -> str:
+    return "—" if v is None else "%.2f%%" % v
+
+
+def _fmt_mb(v) -> str:
+    return "—" if v is None else "%.1f MB" % v
+
+
+def metrics_cli(window: float = 1.2) -> int:
+    """命令行打印各服务占用（现场采两次，不依赖常驻门户）。"""
+    if not _reload_if_changed(force=True):
+        print("读不到配置 %s：%s" % (CONFIG_PATH, _STATE["config_error"]), file=sys.stderr)
+        return 1
+    with _LOCK:
+        services = [dict(s) for s in _STATE["services"]]
+
+    by_key, meta = _SAMPLER.sample_now(services, window=window)
+    total = meta["total"]
+    win = meta["window"]
+    print("资源占用（CPU 为最近 %.1f 秒均值，单核=100%%；内存为 cgroup memory.current / RSS）" % win)
+    print("%s %s %s  %s" % (_pad("服务", 36), _pad("CPU", 9), _pad("内存", 12), "来源"))
+    print("-" * 84)
+    rows = 0
+    for svc in services:
+        m = by_key.get(resource_monitor.service_key(svc)) or {}
+        label = "%s (%s)" % (svc["name"], svc["unit"] or svc["id"])
+        src = m.get("source_label") or m.get("reason") or "—"
+        print("%s %s %s  %s" % (_pad(label, 36), _pad(_fmt_pct(m.get("cpu_pct")), 9),
+                                _pad(_fmt_mb(m.get("mem_mb")), 12), src))
+        rows += 1
+    pm = meta.get("portal") or {}
+    print("-" * 84)
+    print("%s %s %s  %s" % (_pad("门户自身 (screen-portal.service)", 36),
+                            _pad(_fmt_pct(pm.get("cpu_pct")), 9),
+                            _pad(_fmt_mb(pm.get("mem_mb")), 12),
+                            pm.get("source_label") or pm.get("reason") or "—"))
+    print("%s %s %s  %s" % (_pad("合计（含门户自身）", 36), _pad(_fmt_pct(total.get("cpu_pct")), 9),
+                            _pad(_fmt_mb(total.get("mem_mb")), 12),
+                            "整机内存 %s" % _fmt_pct(total.get("mem_pct"))))
+    return 0 if rows else 1
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -386,6 +465,9 @@ def serve(argv: list[str]) -> int:
             open_browser = False
             i += 1
             continue
+        if a == "--metrics":
+            # 命令行查看各服务占用（不启动服务、不占端口）
+            return metrics_cli()
         i += 1
 
     # 固定端口，占用即退出（不漂移，避免书签 / 自启指向错地址）

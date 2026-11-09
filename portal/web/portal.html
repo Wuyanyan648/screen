@@ -93,6 +93,24 @@
   .metaRow{display:flex;gap:14px;flex-wrap:wrap;color:var(--dim);font-size:11.5px;min-height:16px}
   .metaRow b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
   .metaRow .err{color:#ffb3ad}
+  /* 每张卡片一行紧凑资源指标（不做图表） */
+  .resRow{
+    display:flex;align-items:baseline;gap:13px;flex-wrap:wrap;font-size:11.5px;color:var(--dim);
+    min-height:16px;font-variant-numeric:tabular-nums;
+  }
+  .resRow b{color:var(--text);font-weight:600}
+  .resRow b.warn,.resSummary b.warn{color:#ffd28a}
+  .resRow b.bad,.resSummary b.bad{color:#ffb3ad}
+  .resNote{color:#6e7b88;font-size:10.5px}
+  .resSummary{
+    display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+    max-width:1000px;width:100%;margin:0 auto;padding:7px 12px;
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;
+  }
+  .resSummary b{color:var(--text);font-weight:600}
+  .resSummary .rlabel{color:var(--text);font-weight:600}
+  .resSummary[hidden]{display:none}
   .actions{display:flex;gap:8px;align-items:center;margin-top:auto;flex-wrap:wrap}
   .actions .btn{flex:1;min-width:120px}
   .noembed{color:#6e7b88;font-size:11px;line-height:1.45;flex:1}
@@ -133,6 +151,13 @@
 </header>
 
 <main>
+  <div id="resSummary" class="resSummary" hidden>
+    <span class="rlabel">资源占用</span>
+    <span>CPU <b id="sumWin">5</b> 秒均值（单核 100%）</span>
+    <span>合计 CPU <b id="sumCpu">—</b></span>
+    <span>内存 <b id="sumMem">—</b><span id="sumMemPct"></span></span>
+    <span class="resNote" id="sumSelf"></span>
+  </div>
   <div id="grid" class="grid"></div>
   <p class="foot">
     状态由门户后端定时发 HTTP 请求探测（带 1.5 秒超时），页面只读门户自己的接口，不在浏览器里直连被管理服务。
@@ -163,7 +188,20 @@
   var POLL_MS = 2000;
   var state = { sig: "", services: [], inFlight: false, viewer: null, acting: null };
 
+  // 资源占用的标黄/标红阈值（单核 100% 口径）：
+  // 单服务 CPU ≥50% 等于常驻占用半个核，≥90% 基本跑满一个核；内存 512 MB / 1.5 GB 同理。
+  // 合计是「所有服务 + 门户自身」的和，所以阈值放大到 1 核 / 2 核。
+  var RES_CPU_WARN = 50, RES_CPU_BAD = 90;
+  var RES_MEM_WARN = 512, RES_MEM_BAD = 1536;
+  var SUM_CPU_WARN = 100, SUM_CPU_BAD = 200;
+  var SUM_MEM_WARN = 1024, SUM_MEM_BAD = 2048;
+
   function $(id) { return document.getElementById(id); }
+
+  function sevClass(v, warn, bad) {
+    if (typeof v !== "number") return "";
+    return v >= bad ? " bad" : v >= warn ? " warn" : "";
+  }
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -213,6 +251,18 @@
     if (s.port) hostRow.appendChild(el("span", "hostTag", "端口 " + s.port));
     if (s.manage !== "external") hostRow.appendChild(el("span", "hostTag unit", "单元 —"));
 
+    // 一行紧凑资源指标（CPU / 内存），数值由 updateCard 回填
+    var resRow = el("div", "resRow");
+    var cpuItem = el("span");
+    cpuItem.appendChild(document.createTextNode("CPU "));
+    cpuItem.appendChild(el("b", "cpu", "—"));
+    var memItem = el("span");
+    memItem.appendChild(document.createTextNode("内存 "));
+    memItem.appendChild(el("b", "mem", "—"));
+    resRow.appendChild(cpuItem);
+    resRow.appendChild(memItem);
+    resRow.appendChild(el("span", "resNote", ""));
+
     var lastAct = el("div", "lastAct", "");
 
     var actions = el("div", "actions");
@@ -244,6 +294,7 @@
     card.appendChild(top);
     card.appendChild(addr);
     card.appendChild(metaRow);
+    card.appendChild(resRow);
     card.appendChild(hostRow);
     card.appendChild(lastAct);
     card.appendChild(actions);
@@ -281,6 +332,32 @@
       unitTag.className = "hostTag unit " + us;
       unitTag.textContent = "单元 " + us;
       unitTag.title = s.note || "";
+    }
+
+    // 资源占用：识别不到就是「—」，不写 0（0 会让人以为真的在跑但没占用）
+    var m = s.metrics;
+    var cpuB = card.querySelector("b.cpu");
+    var memB = card.querySelector("b.mem");
+    var resNote = card.querySelector(".resNote");
+    if (cpuB) {
+      var cpu = m && typeof m.cpu_pct === "number" ? m.cpu_pct : null;
+      var mem = m && typeof m.mem_mb === "number" ? m.mem_mb : null;
+      cpuB.textContent = cpu === null ? "—" : cpu.toFixed(1) + "%";
+      memB.textContent = mem === null ? "—" : mem.toFixed(1) + " MB";
+      cpuB.className = "cpu" + sevClass(cpu, RES_CPU_WARN, RES_CPU_BAD);
+      memB.className = "mem" + sevClass(mem, RES_MEM_WARN, RES_MEM_BAD);
+      var bits = [];
+      if (m) {
+        if (m.source === "cgroup") bits.push("5s 均值");
+        else if (m.source) bits.push(m.source_label || m.source);
+        if (m.cpu_window) bits.push("窗口 " + m.cpu_window + "s");
+        if (typeof m.mem_pct === "number") bits.push("整机内存 " + m.mem_pct + "%");
+        if (m.reason) bits.push(m.reason);
+      } else {
+        bits.push("未采集到指标（下一轮再看）");
+      }
+      resNote.textContent = bits.join(" · ");
+      resNote.title = m ? [m.detail, m.reason].filter(Boolean).join(" · ") : "";
     }
 
     var last = card.querySelector(".lastAct");
@@ -334,9 +411,32 @@
     }
   }
 
+  function updateSummary(mt) {
+    var box = $("resSummary");
+    if (!mt) { box.hidden = true; return; }
+    box.hidden = false;
+    $("sumWin").textContent = mt.window || "5";
+    var total = mt.total || {};
+    var pm = mt.portal || {};
+    var cpu = typeof total.cpu_pct === "number" ? total.cpu_pct : null;
+    var mem = typeof total.mem_mb === "number" ? total.mem_mb : null;
+    var c = $("sumCpu"), me = $("sumMem");
+    c.textContent = cpu === null ? "—" : cpu.toFixed(1) + "%";
+    me.textContent = mem === null ? "—" : mem.toFixed(1) + " MB";
+    c.className = sevClass(cpu, SUM_CPU_WARN, SUM_CPU_BAD).trim();
+    me.className = sevClass(mem, SUM_MEM_WARN, SUM_MEM_BAD).trim();
+    $("sumMemPct").textContent = typeof total.mem_pct === "number" ? "（整机 " + total.mem_pct + "%）" : "";
+    var self = $("sumSelf");
+    var pCpu = typeof pm.cpu_pct === "number" ? pm.cpu_pct.toFixed(1) + "%" : "—";
+    var pMem = typeof pm.mem_mb === "number" ? pm.mem_mb.toFixed(1) + " MB" : "—";
+    self.textContent = "含门户自身：" + pCpu + " / " + pMem;
+    self.title = pm.detail || pm.reason || "";
+  }
+
   function apply(data) {
     $("lastCheck").textContent = data.checked_text || "—";
     $("interval").textContent = data.interval || "—";
+    updateSummary(data.metrics);
     var cfgErr = data.config_error || "";
     $("cfgErr").hidden = !cfgErr;
     $("cfgErr").textContent = cfgErr ? ("配置问题：" + cfgErr) : "";

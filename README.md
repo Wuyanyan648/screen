@@ -482,6 +482,61 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
   所以这两项都提供「在此页内打开」（整页 iframe + 顶部「← 返回门户 / 新标签页打开」，`Esc` 也可返回）。
 - 离线时「在此页内打开」置灰；启停按钮点击后会在卡片底部显示「最近操作 时间 动作 成功/失败：原因」。
 
+### 资源占用指标（CPU / 内存）
+
+每张卡片多一行紧凑指标（`CPU 2.4%　内存 15.8 MB`），页面顶部另有一条合计；不做图表，
+两张卡片的布局不变。
+
+**数据来源：优先 cgroup，不按进程名抓 `ps`**
+
+| 情况 | 读法 | 界面标注 |
+| --- | --- | --- |
+| systemd 用户单元（8765、8760） | `systemctl --user show -p ControlGroup` 拿路径，直读 `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/.../<unit>/` 下的 `cpu.stat`、`memory.current` | `5s 均值` |
+| systemd 系统单元（8787 `usbnicd.service`） | 同上，路径在 `/sys/fs/cgroup/system.slice/`；本机普通用户可读，不需要 sudo | `5s 均值` |
+| cgroup 读不到（单元不存在 / 权限异常） | 退化为 `MainPID` + `/proc/<pid>` 整棵进程树（RSS 求和、`utime+stime` 差值） | `进程树降级` + 原因 |
+| 未托管的外部服务（`manage: external` + `process: <名字>`） | 扫 `/proc`，按 `comm` 或命令行里的脚本名匹配 | `按进程名估算` |
+
+cgroup 路径缓存 60 秒（`systemctl show` 不是每轮都跑），常态采样每 5 秒只有几次 `read()`，
+既不 fork 也不扫 `ps`。
+
+**口径**
+
+- CPU：两次采样之间 `cpu.stat` 的 `usage_usec` 差值 ÷ 实际间隔，归一到**单核 100%**
+  （与 `systemd-cgtop` 一致：跑满两个核显示 200%）。窗口就是后端探测周期，默认 5 秒，
+  不用瞬时值；间隔小于 2 秒不重算（点「立即检测」不会打出尖峰），沿用上一次的读数。
+- 内存：`memory.current`（cgroup，含该单元的 page cache）或进程树 RSS，单位 MB；tooltip 里有整机占比。
+- 第一次采样没有上一个读数，CPU 显示 `—`，下一轮（约 5 秒）出数。**任何识别不到的字段都显示 `—`，
+  不会写 0**——0 会被误解成「进程在跑但没占用」。
+
+**阈值**（标黄 / 标红，单核 100% 口径）
+
+| 指标 | 黄 | 红 | 为什么这么定 |
+| --- | --- | --- | --- |
+| 单服务 CPU | ≥50% | ≥90% | 50% 等于长期占住半个核，在这台 20 线程机器上已属「该警惕的常驻开销」；90% 基本跑满一核 |
+| 单服务内存 | ≥512 MB | ≥1.5 GB | 这几个服务的正常量级是十几到几十 MB，过 512 MB 多半是泄漏或缓存堆积 |
+| 合计 CPU | ≥100% | ≥200% | 合计是「所有服务 + 门户自身」，阈值放大到 1 核 / 2 核 |
+| 合计内存 | ≥1 GB | ≥2 GB | 同上，取整机内存（约 15 GB）的十分之一 / 七分之一 |
+
+**门户自身**：`screen-portal.service` 也是用户单元，指标同样按 cgroup 采，只出现在顶部合计条
+（`含门户自身：0.2% / 16.1 MB`），不占一张卡片。
+
+**API / CLI**
+
+- `GET /api/status`：每个服务多一个 `metrics` 对象，顶层多一个 `metrics`（含 `portal` / `total` /
+  `window` / `cpu_basis`）；识别不到时 `cpu_pct`、`mem_mb` 为 `null`，并带 `reason` 说明原因。
+- `python3 portal/portal_server.py --metrics` 直接打印表格（现场采两次、1.2 秒窗口，不监听端口）：
+
+  ```text
+  资源占用（CPU 为最近 1.2 秒均值，单核=100%；内存为 cgroup memory.current / RSS）
+  服务                                 CPU       内存          来源
+  ------------------------------------------------------------------------------------
+  屏幕输出管理 (screen-manager.service) 3.93%     15.8 MB       cgroup
+  网络管理 (usbnicd.service)           0.71%     44.8 MB       cgroup
+  ------------------------------------------------------------------------------------
+  门户自身 (screen-portal.service)     0.07%     14.4 MB       cgroup
+  合计（含门户自身）                   4.71%     75.0 MB       整机内存 0.48%
+  ```
+
 ### 要不要做成通用框架？
 
 **结论：就做静态门户 + JSON 清单，不抽框架。** 新增服务已经只需加一段 JSON；
@@ -502,6 +557,27 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
 - **未做/未验证**：8787 的实际「停止→恢复」没有执行——它需要上面三条 sudo 才安全可控，
   且本会话没有 sudo 密码；其余路径（在线探测、unit 状态、启动按钮）已实测。
   浏览器自动化环境不可用，页面用 curl/静态检查验证，未采集真实浏览器 console。
+
+**资源占用指标验证（2026-11-09，同一时刻对照 `systemd-cgtop` 与 `systemctl show`）**
+
+```text
+cgtop  /…/app.slice   screen-manager.service   3   3.4%   15.3M → 14.6M
+                      screen-portal.service    2   0.3%   14.9M → 14.1M
+cgtop  /system.slice  usbnicd.service          8   0.0%   45.3M
+systemctl show -p MemoryCurrent   15691776（15.0 MiB） / 14393344（13.7 MiB） / 47603712（45.4 MiB）
+门户 /api/status      screen 3.43%（窗口 5.0s）/ 15.6 MB；usbnic 1.4–2.1% / 44.4 MB；portal 0.19–0.25% / 15.4 MB
+                      total 5.7% / 75.8 MB（整机 0.48%）
+```
+
+- CPU 与 cgtop 同一量级（3.43% vs 3.4%）；内存与 `MemoryCurrent` 差在 1 MB 上下
+  （`memory.current` 会随 page cache 浮动，cgtop 显示同一字段的取整值）。数量级一致。
+- 页面：三卡（临时加一张不存在的单元）与两卡布局都实测截图；不存在的单元显示
+  `CPU —　内存 —`，备注写 `systemctl show 没返回 ControlGroup / MainPID（单元可能不存在）`，
+  没有出现 0；该临时条目已从 `services.json` 还原。
+- 阈值配色：用临时 mock 数据（CPU 62% / 内存 700 MB → 黄；95% / 1800 MB → 红；合计 157.9% → 红）
+  截图核对像素颜色通过；真实数据未触发阈值，测完没有留下任何人为的高占用。
+- 单元停止 → 重启后第一轮 CPU 显示 `—`（没有上一个 `usage_usec`），下一轮恢复出数；
+  8787 重启时确实出现过一次 `usbnic offline / 连接被拒绝`，与本功能无关，是当时服务正在启动。
 
 ## 运行期文件
 
@@ -547,6 +623,11 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
   `xrandr --output DP-4 --auto` 依次尝试，最坏情况重启图形会话。
 - 8787 是 root 系统单元；不装可选 sudo drop-in 时，注销不会停它，门户里它的启停会因
   polkit 认证失败（其余服务不受影响）。
+- 资源指标里的「内存」是 cgroup `memory.current`（含该单元的 page cache），与 `ps` 的 RSS
+  不是一回事，数值会随文件缓存浮动；外部服务的「按进程名估算」只求和命中的进程，会漏掉
+  改过名的子进程。
+- cgroup 读不到时降级到 `/proc` 进程树，CPU 由 tick 换算，精度略低；单元刚重启的第一轮
+  CPU 没有差值可算，会显示 `—`（下一轮自动出数）。
 
 ## 验证状态
 

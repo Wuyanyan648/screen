@@ -1,5 +1,5 @@
 {
-  "_comment": "示例模板：复制成 services.json 后按自己的服务改。字段说明见 README「本机服务门户」。id 必须唯一；health 是拼接在 url 后面的健康检查路径，也可以直接写完整 http(s) 地址；embed 只有当实测该服务没有 X-Frame-Options / CSP 限制时才写 true；manage 可选 user-unit / system-unit / external。",
+  "_comment": "示例模板：复制成 services.json 后按自己的服务改。字段说明见 README「本机服务门户」。id 必须唯一；health 是拼接在 url 后面的健康检查路径，也可以直接写完整 http(s) 地址；embed 只有当实测该服务没有 X-Frame-Options / CSP 限制时才写 true；manage 可选 user-unit / system-unit / external。托管为 systemd 单元的服务，CPU/内存按 cgroup 采样；manage=external 时补一个 process 字段（进程名或脚本名，例如 dm_server.py），门户会按进程名扫 /proc 估算并在界面标注「按进程名估算」。",
   "services": [
     {
       "id": "example-app",
