@@ -127,6 +127,24 @@
   .asideFoot{padding:10px 12px;border-top:1px solid var(--line)}
   .asideFoot summary{cursor:pointer;color:var(--dim);font-size:12px;outline:none}
   .asideFoot .help{margin-top:8px}
+  /* 护眼休息 */
+  .breakCard{
+    flex:0 0 auto;margin:12px 12px 0;padding:10px 12px;
+    background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+  }
+  .breakCard h3{margin:0 0 6px;font-size:13px;display:flex;align-items:center;gap:6px}
+  .breakCard h3 .badge{margin-left:auto}
+  .bkStatus{font-size:12.5px;line-height:1.55;font-variant-numeric:tabular-nums}
+  .bkStatus b{color:var(--text)}
+  .bkStatus small{color:var(--dim)}
+  .bkRow{display:flex;align-items:center;gap:6px;margin-top:7px;font-size:11.5px;color:var(--dim);flex-wrap:wrap}
+  .bkRow input[type=number]{
+    width:58px;font:inherit;color:var(--text);background:#0d1117;
+    border:1px solid var(--line);border-radius:5px;padding:3px 5px;
+  }
+  .bkRow select{flex:1;min-width:0}
+  .breakCard .bkToggle{margin-top:8px;width:100%;padding:5px 8px}
+  .breakCard .help{margin-top:7px}
   #mask{
     position:fixed;inset:0;background:rgba(3,6,10,.72);display:none;
     align-items:center;justify-content:center;padding:20px;z-index:50;
@@ -210,6 +228,7 @@
   </div>
 
   <aside>
+    <div id="breakPanel" class="breakCard"></div>
     <div class="asideScroll" id="cards"></div>
     <div class="asideFoot">
       <details>
@@ -325,6 +344,7 @@ async function refresh(manual){
     }
     if(selected && !state.outputs.some(o=>o.name===selected)) selected = null;
     setConn(true);
+    paintBreak(state.break);   // 护眼休息就地更新，不受下面「结构没变就直接返回」影响
     render();
     if(manual) toast('状态已更新');
     return true;
@@ -578,6 +598,98 @@ function syncThreshold(){
     sel.appendChild(opt);
   }
   sel.value = String(v);
+}
+
+/* ---------------- 护眼休息 ---------------- */
+function buildBreakPanel(){
+  const p = $('#breakPanel');
+  p.innerHTML = `
+    <h3>护眼休息 <span id="bkBadge" class="badge">-</span></h3>
+    <div class="bkStatus" id="bkStatus">-</div>
+    <div class="bkRow">
+      <span>工作</span><input id="bkWork" type="number" min="1" max="240" step="1"
+        title="连续用眼多少分钟后提醒休息（1~240 分钟）"><span>分钟</span>
+      <span style="margin-left:6px">休息</span><input id="bkBreak" type="number" min="1" max="60" step="1"
+        title="每次休息覆盖层显示多久（1~60 分钟）"><span>分钟</span>
+    </div>
+    <div class="bkRow"><span>覆盖屏</span><select id="bkScreen"
+      title="到点后只在这块屏上铺倒计时，其他屏不受影响"></select></div>
+    <button id="bkToggle" class="ghost bkToggle">启用</button>
+    <div class="help">
+      到点后在选中的屏上铺一层深色倒计时，按 ESC 或点「跳过」可提前结束，结束时间会记进日志。
+      它的作用只是打断近距离用眼、引导远眺和提醒眨眼——<b>不是治疗</b>，也不声称动画能改善视力。
+      覆盖层不会比你当前的画面更亮：背景固定在 #12161A~#1B2328，文字亮度跟随当前亮度，色温沿用当前设置。
+    </div>`;
+  $('#bkWork').onchange = ()=> saveBreak({work_min: Number($('#bkWork').value)});
+  $('#bkBreak').onchange = ()=> saveBreak({break_min: Number($('#bkBreak').value)});
+  $('#bkScreen').onchange = ()=> saveBreak({screen: $('#bkScreen').value});
+  $('#bkToggle').onclick = ()=>{
+    const on = !!(state && state.break && state.break.enabled);
+    saveBreak({enabled: !on});
+  };
+}
+
+function syncBreakScreens(b){
+  const sel = $('#bkScreen');
+  if(document.activeElement === sel) return;
+  const names = state.outputs.filter(o=>o.enabled).map(o=>o.name);
+  const key = names.join(',') + '|' + b.screen;
+  if(sel.dataset.key !== key){
+    sel.innerHTML = '';
+    for(const n of names){
+      const o = document.createElement('option');
+      o.value = n; o.textContent = n;
+      sel.appendChild(o);
+    }
+    if(!names.includes(b.screen)){
+      const o = document.createElement('option');
+      o.value = b.screen; o.textContent = `${b.screen}（未启用）`;
+      sel.appendChild(o);
+    }
+    sel.dataset.key = key;
+  }
+  sel.value = b.screen;
+}
+
+// 每 2 秒随状态轮询更新一次，就地改文字，不重建 DOM（避免输入框失焦）
+function paintBreak(b){
+  if(!b) return;
+  const badge = $('#bkBadge');
+  if(!badge) return;
+  const fast = b.enabled ? (b.phase === 'break' ? ['badge live', '休息中'] : ['badge info', '专注中'])
+                         : ['badge dead', '已暂停'];
+  badge.className = fast[0];
+  badge.textContent = fast[1];
+  const st = $('#bkStatus');
+  if(!b.enabled){
+    st.innerHTML = `已暂停 <small>· 计时冻结在距下次休息 ${Math.max(0, Math.ceil(b.remaining/60))} 分钟</small>`;
+  }else if(b.phase === 'break'){
+    st.innerHTML = `休息中 <small>· 剩余 ${fmtDur(b.remaining)}，按 ESC 或点「跳过」可提前结束</small>`;
+  }else if(b.idle_postponed){
+    st.innerHTML = `闲置提醒正在显示 <small>· 本轮休息延后 ${Math.round(b.defer)} 秒后再试，两个覆盖层不叠加</small>`;
+  }else{
+    st.innerHTML = `距下次休息 <b>${Math.ceil(b.remaining/60)}</b> 分钟`
+                 + `<small> · 第 ${b.round + 1} 轮，已跳过 ${b.skip_count || 0} 次</small>`;
+  }
+  const w = $('#bkWork'), r = $('#bkBreak');
+  if(document.activeElement !== w) w.value = b.work_min;
+  if(document.activeElement !== r) r.value = b.break_min;
+  syncBreakScreens(b);
+  const t = $('#bkToggle');
+  t.textContent = b.enabled ? '暂停（开会 / 演示时用）' : '启用';
+  t.className = 'bkToggle ' + (b.enabled ? 'ghost' : 'primary');
+}
+
+async function saveBreak(patch){
+  const r = await post('/api/break', patch);
+  if(r.ok && r.break){
+    state.break = r.break;
+    paintBreak(r.break);
+    if('enabled' in patch) toast(r.break.enabled ? '护眼休息已启用' : '护眼休息已暂停');
+  }else{
+    toast('护眼休息设置失败：' + (r.error || '未知错误'), true);
+    refresh(false);
+  }
 }
 
 // 只把「会改变结构/文案」的字段放进来；闲置秒数按分钟取整，避免每 2 秒重绘
@@ -1169,6 +1281,7 @@ document.addEventListener('visibilitychange', ()=>{
   if(!document.hidden && !dialogOpen && !busy) refresh(false);
 });
 
+buildBreakPanel();
 refresh(false);
 </script>
 </body>

@@ -19,6 +19,7 @@ import dm_core as core  # noqa: E402
 import dm_brightness  # noqa: E402
 import dm_hotkey  # noqa: E402
 import dm_idle  # noqa: E402
+import dm_break  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(ROOT, "web")
@@ -54,9 +55,14 @@ class Handler(SimpleHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/state":
             try:
-                self._json(core.snapshot())
+                snap = core.snapshot()
+                snap["break"] = dm_break.status()   # 护眼休息不需要额外跑 xrandr
+                self._json(snap)
             except core.DMError as e:
                 self._json({"ok": False, "error": str(e)}, 500)
+            return
+        if path == "/api/break":
+            self._json({"ok": True, "break": dm_break.status()})
             return
         if path == "/api/log":
             self._json({"ok": True, "lines": core.read_log_tail(80)})
@@ -107,6 +113,9 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json({"ok": True, "plan": core.plan_off(name)})
                 elif path == "/api/config":
                     self._json({"ok": True, "config": core.save_config(body)})
+                elif path == "/api/break":
+                    # 启停 / 改时长 / 改覆盖屏；到点由后台调度线程铺覆盖层
+                    self._json({"ok": True, "break": dm_break.configure(body)})
                 elif path == "/api/brightness":
                     if not name:
                         self._json({"ok": False, "error": "缺少输出名"}, 400)
@@ -203,6 +212,9 @@ def serve(argv: list[str]) -> int:
     core.log("全局快捷键注册: %s -> restore-all，ok=%s%s" % (
         dm_hotkey.KEY_COMBO, hotkey.ok, ("  错误: " + hotkey.error) if hotkey.error else ""))
 
+    # 护眼休息：50/5 分钟定时，到点在指定屏铺一层可跳过的倒计时（状态落盘可恢复）
+    dm_break.start()
+
     print("display-manager 界面: %s" % url)
     print("闲置检测依据: %s" % rep["basis"])
     print("全局快捷键: %s = 恢复全部输出" % dm_hotkey.KEY_COMBO)
@@ -219,6 +231,7 @@ def serve(argv: list[str]) -> int:
     finally:
         hotkey.stop()
         monitor.stop()
+        dm_break.stop()
         srv.server_close()
         core.log("网页界面已退出")
     return 0
