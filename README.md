@@ -4,8 +4,27 @@
 三屏布局可视化出来，逐块开关某一路输出，并提醒「这块屏似乎闲置，要不要关掉」。
 界面为中文，逻辑只有一份（`backend/dm_core.py`），网页界面和命令行共用。
 
-- 当前实测机型：RTX 3060 Laptop，输出 `DP-0`（AOC U27G3X，3840×2160@160，133% 缩放，primary）、
-  `DP-4`（内置 BOE，2560×1600@165，133%，内屏）、`HDMI-0`（便携屏，2880×1800@100，每边 1.144 倍偏移的 133% 级缩放）。
+- 当前实测机型：RTX 3060 Laptop，输出 `DP-0`（AOC U27G3X，3840×2160@160，133% 缩放）、
+  `DP-4`（内置 BOE，2560×1600@165，133%，**本机当前是 primary**）、
+  `HDMI-0`（便携屏，2880×1800@100，1.1444 倍缩放）。
+  注意：需求描述里写的「DP-0 primary」与本机 `xrandr` 实际输出不一致（实际是 DP-4 primary），
+  本工具只如实展示、不擅自改 primary。
+
+## 适用范围（先读这个）
+
+- **系统**：Linux；本机验证环境为 **Ubuntu 24.04 + GNOME 46 + X11（ubuntu-xorg 会话）**，
+  NVIDIA 专有驱动 595（RTX 3060 Laptop），`xrandr 1.5.2` / RandR 1.6，Python 3.12。
+- **前提**：`xrandr` 可用、能列出各输出与 CRTC 几何。所有开关动作都是 `xrandr` 命令，
+  没有直接碰驱动或 sysfs。
+- **Wayland：不可用 / 未验证**。Wayland 会话下 `xrandr` 一般只能读不能改布局，
+  「分数缩放靠 transform」这套做法也不成立；本工具若在 Wayland 下运行，只会显示状态、
+  开关会失败（失败信息与 xrandr stderr 会写进日志）。请在登录时选择
+  「Ubuntu on Xorg」/ `ubuntu-xorg` 会话再使用。
+- **其他发行版**：需自行确认 `xrandr` 版本、`libXdamage.so.1` / `libXss.so.1` 是否存在、
+  Python ≥ 3.10（代码用了 `X | None` 写法）。GNOME 之外的桌面环境未验证，
+  尤其「关屏后 mutter 会重新套用自己的显示配置」这类行为在 KDE 等环境下可能不同。
+- 内置屏识别依赖 `xrandr --verbose` 里的 `ConnectorType: Panel`；若某驱动没有这个字段，
+  「不关内屏」这条保护会失效（此时会退化成只能靠「不关最后一块亮屏」兜底）。
 
 ## 快速开始
 
@@ -174,15 +193,30 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 
 ## 验证状态
 
-已验证（本机真机）：
+已验证（本机真机，2026-11-09）：
 
-- 三屏状态读取、几何/模式/刷新率/transform/缩放解析（DP-0 / DP-4 / HDMI-0 数值与需求一致）；
+- 三屏状态读取、几何/模式/刷新率/transform/缩放解析（DP-0 / DP-4 / HDMI-0 数值与需求描述一致）；
+- **HDMI-0 关闭再开启的完整回归**（关闭前后 `xrandr --query` 对比）：
+
+  ```text
+  关闭前  HDMI-0 connected 3296x2060+4289+2880 (normal ...) 302mm x 189mm
+  关闭后  HDMI-0 connected (normal left inverted right x axis y axis)      ← 无几何
+         Screen 0: current 5120 x 5010（从 7585x5010 收缩，DP-0 / DP-4 未动）
+  恢复后  HDMI-0 connected 3296x2060+4289+2880 (normal ...) 302mm x 189mm
+  transform: 1.144440,0,0,0,1.144440,0,0,0,1（与关闭前一致），2880x1800@100.00
+  重叠检查: overlaps = []，画布回到 7585x5010
+  ```
+
+- 恢复来源两条路径都跑通：优先用 `~/.cache/display-manager.state` 的四件套，
+  没有记录时回退到 `~/.cache/hdmi-watchdog.layout` 的基线；
+- 「拒绝关闭内屏」：`off DP-4` / `plan DP-4` 均返回拒绝并说明原因（退出码 2）；
 - XDamage 逐屏归属：在 DP-0 区域弹出 `xmessage` 窗口时只有 DP-0 计时被重置，
   DP-4 / HDMI-0 计时继续增长；
 - `dm_cli.py list`、`/api/state` 返回完整快照（含 idle 字段）。
 
 尚未验证 / 待补：
 
-- 浏览器界面的实际渲染与交互（布局图缩放、角标按钮、阈值保存）；
-- 「关掉 HDMI-0 再开回来」前后的 `xrandr --query` 对比（计划在本轮收尾时执行并记录到提交说明）；
-- 内屏拒绝、最后一块拒绝的界面表现（逻辑已实现，未逐条实测）。
+- 「拒绝关闭最后一块亮屏」没有真机触发（要先把另外两块都关掉，风险不划算），
+  仅代码路径与界面置灰逻辑审阅过；
+- 浏览器界面的实际渲染与交互（布局图缩放、角标按钮、阈值保存）只做了接口验证，
+  未逐一点击；如需截图请在本机打开 `./start.sh` 后自行确认。

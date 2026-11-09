@@ -243,7 +243,7 @@ def state_get(name: str) -> dict | None:
     """状态文件字段: 名字 模式 刷新率 位置X 位置Y transform(9项逗号) geometry primary"""
     for line in _read_lines(STATE_FILE):
         p = line.split()
-        if p[0] != name or len(p) < 9:
+        if p[0] != name or len(p) < 8:
             continue
         try:
             return {
@@ -560,6 +560,9 @@ def turn_on(name: str, reason: str = "cli") -> dict:
         log("恢复 %s 失败 rc=%d ；xrandr stderr: %s" % (name, rc, detail))
         raise DMError("xrandr 恢复 %s 失败（rc=%d）：%s" % (name, rc, detail or "无输出"))
 
+    state_drop(name)
+    off_unmark(name)
+
     after = snapshot()
     got = _find(after, name)
     exp = "%dx%d+%d+%d" % (int(rec["geometry"].split("x")[0]), int(rec["geometry"].split("x")[1]),
@@ -575,8 +578,6 @@ def turn_on(name: str, reason: str = "cli") -> dict:
             "%s/%s %dx%d" % (x["a"], x["b"], x["w"], x["h"]) for x in ov)
         log("警告: 布局存在重叠 " + json.dumps(ov, ensure_ascii=False))
 
-    state_drop(name)
-    off_unmark(name)
     log("已启用 %s: %s@%s 几何 %s" % (name, got["mode"], got["rate"], actual))
     return {"ok": True, "action": "on", "name": name, "state": after,
             "restored_from": src, "geometry": actual, "warning": warn,
