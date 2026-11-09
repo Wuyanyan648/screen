@@ -154,7 +154,7 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
    全局快捷键 `Ctrl+Alt+Shift+F12`；关掉界面自身所在屏时默认 20 秒自动开回。
    下次打开界面时该输出会以「已关闭」出现在列表和托盘里，点一下就能开回来（参数来自状态文件）。
 
-## 与 `~/.local/bin/hdmi-watchdog.sh` 的共存（已核实）
+## 与 `~/.local/bin/hdmi-watchdog.sh` 的共存（已打补丁）
 
 读源码 + 看它的日志后的结论：
 
@@ -162,24 +162,64 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
   没有传环境变量，所以实际运行在 0。该模式下它**只在「先观测到 disconnected，之后又回来但没启用」**
   这个特征序列下才补 `xrandr`；用户主动关闭（connected 但没有几何）不会被拉起，
   它的日志实测就是这么写的：`HDMI-0 被关闭且无掉线前兆（可能是用户主动关闭），保留基线但不自动点亮`
-  （2026-11-09 21:19 的多条记录）。所以**本界面的日常关闭是与看门狗相容的**，我们没有改它。
-- 唯一残留冲突：在本界面关掉 `HDMI-0` 之后，如果**物理拔插一次线**（真实 HPD 掉线又回来），
-  看门狗会认为这是故障，用 `~/.cache/hdmi-watchdog.layout` 里的基线把它点亮。
-  这不是本工具常规路径，但确实会在「关了线又拔插」时发生。处理方式：
-  - 本工具在关闭时会往 `~/.cache/display-manager.off` 写一份「用户主动关闭名单」，
-    但**不改动**看门狗的脚本和基线（基线是恢复所需的参数，删了反而没法一键开回来）。
-  - 如果你希望连这一步也拦住，可选补丁（**由你决定是否执行**，本仓库不自动改别人的脚本）：
-    在 `hdmi-watchdog.sh` 的 `off)` 分支、`recover "$n"` 之前插入
+  （2026-11-09 的多条记录）。所以**本界面的日常关闭本来就与看门狗相容**。
 
-    ```bash
-    if grep -qx "$n" "$HOME/.cache/display-manager.off" 2>/dev/null; then
-      log "$n 是用户在 screen 界面里主动关闭的，跳过自动恢复"
-      continue
-    fi
-    ```
+### 残留冲突已修复（2026-11-09 打补丁，经用户批准）
 
-    恢复方式：把 `~/.cache/display-manager.off` 里对应名字删掉（在本界面点「开启」时会自动清），
-    或直接 `python3 backend/dm_cli.py restore-all`，看门狗随即恢复原有的兜底行为。
+原冲突：在本界面关掉 `HDMI-0` 之后，如果**物理拔插一次线**（真实 HPD 掉线又回来），
+看门狗会认为这是故障，用 `~/.cache/hdmi-watchdog.layout` 里的基线把它点亮。
+
+- 改动文件：`~/.local/bin/hdmi-watchdog.sh`（**不在本仓库内**，这是跨项目改动，在此留档）
+- 备份：`~/.local/bin/hdmi-watchdog.sh.bak-20261109-2155`（与原文件同权限，可直接回滚）
+- 补丁内容：
+
+  ```bash
+  # 变量区新增
+  USER_OFF="${USER_OFF:-$HOME/.cache/display-manager.off}"
+  is_user_off() { [ -s "$USER_OFF" ] && grep -qxF -- "$1" "$USER_OFF"; }
+
+  # 「掉线后又回来但未启用」分支，recover 前：
+  if is_user_off "$n"; then
+    log "$n 在界面主动关闭名单里（$USER_OFF），跳过自动恢复"
+    WAS_ON[$n]=0; SAW_DISC[$n]=0
+    continue
+  fi
+
+  # FORCE_RECOVER=1 的兜底分支同样检查（默认 0，不影响现状）：
+  if is_user_off "$n"; then
+    log "$n 在界面主动关闭名单里（$USER_OFF），跳过兜底还原"
+    WAS_ON[$n]=0; unset 'OFF_TS[$n]'
+    continue
+  fi
+  ```
+
+- **名单清理逻辑已存在并实测**：`dm_core.turn_on()` 成功恢复（以及本来就已启用）时都会调用
+  `off_unmark(name)`，把该输出从 `~/.cache/display-manager.off` 删除。
+  实测：`dm_cli.py off HDMI-0` → 名单变为 `HDMI-0`；`dm_cli.py on HDMI-0` → 名单变回空。
+  所以以后拔插线时，只有「仍被用户关着」的屏才被跳过，重新开过的屏恢复正常兜底。
+- 验证证据：
+  - `bash -n ~/.local/bin/hdmi-watchdog.sh` → OK。
+  - 假 xrandr 构造「on → disconnected → connected 但 off」序列（两组独立临时目录）：
+    - 名单为空：日志出现 `HDMI-0 已连接但未启用，按基线还原`，随后 `已启用，状态正常`，
+      并实际调用 `xrandr --output HDMI-0 --mode 2880x1800 --rate 100.00+ --pos 0x0`；
+    - 名单含 `HDMI-0`：日志出现 `HDMI-0 在界面主动关闭名单里（…/user.off），跳过自动恢复`，
+      **没有**任何 `xrandr --output` 调用，状态保持 off。
+  - 真机重启看门狗（旧 pid 512080 → 新 pid 694604）后，日志出现新的
+    `start: panel=[DP-4] guarded=[auto] interval=3s`，三屏布局与重启前完全一致；
+    随后真机 `off HDMI-0` / `on HDMI-0`，看门狗日志仍为
+    `被关闭且无掉线前兆（可能是用户主动关闭）…` / `已启用，状态正常`，没有抢控制权。
+- 生效方式：脚本改动只对**新启动**的进程生效。本次已手动重启；
+  下次登录 autostart 也会用新脚本。手动重启命令（不会改布局）：
+
+  ```bash
+  pkill -f "[h]dmi-watchdog.sh"
+  setsid -f ~/.local/bin/hdmi-watchdog.sh >/dev/null 2>&1
+  ```
+
+- 回滚：`cp -a ~/.local/bin/hdmi-watchdog.sh.bak-20261109-2155 ~/.local/bin/hdmi-watchdog.sh`
+  后按上面的命令重启即可。
+- 恢复被跳过的屏：在本界面点「开启」或 `python3 backend/dm_cli.py restore-all`
+  （会同时清掉名单），看门狗随即恢复原有兜底行为。
 
 ## 与 `~/.cache/screen-off.state` 的关系
 
@@ -323,6 +363,9 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
   测完已把阈值恢复成 300 秒。
 - 恢复后三屏几何：DP-0 `5120x2880+0+0`、DP-4 `3408x2130+881+2880`（primary）、
   HDMI-0 `3296x2060+4289+2880`，`overlaps = []`。
+- **看门狗补丁**：`bash -n` 通过；假 xrandr 两用例分别验证「名单外仍自动恢复」「名单内跳过」；
+  真机重启看门狗（512080 → 694604）后三屏布局不变；真机 `off HDMI-0` / `on HDMI-0`
+  验证名单的写入与自动清理（详见上文「与 hdmi-watchdog.sh 的共存」）。
 
 尚未验证 / 待补：
 
