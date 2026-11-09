@@ -118,11 +118,29 @@ def _stored() -> dict:
         return {}
 
 
+# 通道锁定：把某块屏钉死在某个通道。锁成 software 后整条亮度链路都不再调用 ddcutil。
+# 背景（2026-11-10）：AOC 关掉 HDR 后所有 VCP 写入都被显示器忽略，原来「先试硬件、
+# 失败再回落」会闪一下、慢半秒，还会把亮度带偏。DP-0 现在永久锁在 software，
+# 界面不提供切回硬件的入口；配置里的 lock 字段保留，需要时可由 CLI 改动。
+LOCK_SOFTWARE = "software"
+_LOCK_MODES = ("software", "ddc", "backlight")
+_KEEP = object()
+
+
+def lock_of(name: str) -> str | None:
+    """读取该输出的通道锁定值；没有锁定返回 None。"""
+    st = _stored().get(name) or {}
+    lock = st.get("lock")
+    return lock if lock in _LOCK_MODES else None
+
+
 def _store(name: str, value: int, mode: str, extra: int = 0,
-           fallback: dict | None = None, temp: int | None = None) -> None:
+           fallback: dict | None = None, temp: int | None = None,
+           lock=_KEEP) -> None:
     """落盘。value 是主通道值（硬件百分比；纯软件时是 gamma 百分比），
     extra 是硬件到底后叠加的软件层（0 = 不叠加），temp 是夜间色温（K，6500 = 原生）。
-    temp 不传时沿用上一次记录，避免调亮度顺手把色温清掉。"""
+    temp 不传时沿用上一次记录，避免调亮度顺手把色温清掉。
+    lock 不传时沿用上一次的锁定；显式传 None 表示解除锁定。"""
     data = _stored()
     prev = data.get(name) or {}
     rec = {"value": int(value), "mode": mode, "extra": int(extra),
@@ -130,6 +148,9 @@ def _store(name: str, value: int, mode: str, extra: int = 0,
            "time": datetime.now().strftime("%F %T")}
     if fallback:
         rec["fallback"] = fallback
+    lock_val = prev.get("lock") if lock is _KEEP else lock
+    if lock_val in _LOCK_MODES:
+        rec["lock"] = lock_val
     data[name] = rec
     os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = BRIGHT_FILE + ".tmp"
@@ -358,9 +379,15 @@ def _ddc_get(bus: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
-def _ddc_set(bus: str, pct: int) -> None:
-    rc, out, err = _run(["ddcutil", "--bus", _bus_num(bus), "--sleep-multiplier", "0.3",
-                         "setvcp", "10", str(pct)], 12)
+def _ddc_set(bus: str, pct: int, verify: bool = True) -> None:
+    cmd = ["ddcutil"]
+    if not verify:
+        # 拖动中的实时值不做读回校验（ddcutil 自带 verify 也会多一次读），
+        # 松手后的最终值仍走完整校验。锁软件通道的屏根本不会走到这里。
+        cmd.append("--noverify")
+    cmd += ["--bus", _bus_num(bus), "--sleep-multiplier", "0.3",
+            "setvcp", "10", str(pct)]
+    rc, out, err = _run(cmd, 12)
     if rc != 0:
         raise _ddc_error(err or out)
 
@@ -494,6 +521,15 @@ def _int_extra(st: dict) -> int:
 # --------------------------------------------------------------------------- #
 def _pick_mode(o: dict) -> tuple[str, dict, str | None, str | None, str | None]:
     """返回 (mode, 附加信息, note, reason, hint)。mode ∈ ddc/backlight/software/none。"""
+    name = o["name"]
+    if lock_of(name) == LOCK_SOFTWARE:
+        # 锁定后连 ddcutil detect 都不跑：不闪、不慢、不改动硬件值
+        if not o.get("enabled"):
+            return "none", {"locked": True}, None, "屏已关闭，gamma 调光无法生效", None
+        return ("software", {"locked": True},
+                "已锁定软件调光：固定使用 gamma，不再调用 ddcutil",
+                None, None)
+
     panel = bool(o.get("panel"))
     bl = backlight_info()
     ddc = _ddc_state()
@@ -593,6 +629,7 @@ def _night_light_cached() -> dict:
 def _entry(o: dict, details: dict, refresh: bool) -> dict:
     name = o["name"]
     o = dict(o, _details=details.get(name) or {})
+    lock = lock_of(name)
     mode, info, note, reason, hint = _pick_mode(o)
     stored = _stored().get(name) or {}
     value = None
@@ -616,12 +653,13 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         cur = bl["actual"] if bl["actual"] is not None else bl["cur"]
         value = None if cur is None else int(round(cur * 100.0 / bl["max"]))
     elif mode == "software":
-        if stored and not refresh and stored.get("mode") == "software":
+        # 锁定时只认落盘值，读也不去碰硬件
+        if lock == LOCK_SOFTWARE or (stored and not refresh and stored.get("mode") == "software"):
             value = stored.get("value")
         else:
             g = (details.get(name) or {}).get("brightness")
             value = None if g is None else int(round(g * 100))
-        if stored.get("mode") == "software" and stored.get("fallback"):
+        if lock != LOCK_SOFTWARE and stored.get("mode") == "software" and stored.get("fallback"):
             fallback = stored["fallback"]
 
     if value is None and stored and mode != "none":
@@ -671,14 +709,18 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         label, gamma = MODE_LABEL["none"], None
     elif mode == "software":
         gamma = None if value is None else round(value / 100.0, 2)
-        label = MODE_LABEL["software"] + ("（硬件写失败回落）" if fallback else "（纯软件）")
-        if fallback:
-            note = "硬件 %s 写失败，已回落软件调光%s：%s" % (
-                fallback.get("from") or "通道",
-                "" if gamma is None else "（gamma %.2f）" % gamma,
-                fallback.get("reason") or "未知原因")
-        elif not note:
-            note = "纯软件通道：gamma 直接压暗，亮度越低对比度越差"
+        if lock == LOCK_SOFTWARE:
+            label = "软件调光（已锁定，不影响对比度以外的东西）"
+            note = "已锁定软件通道：固定使用 gamma，不再调用 ddcutil"
+        else:
+            label = MODE_LABEL["software"] + ("（硬件写失败回落）" if fallback else "（纯软件）")
+            if fallback:
+                note = "硬件 %s 写失败，已回落软件调光%s：%s" % (
+                    fallback.get("from") or "通道",
+                    "" if gamma is None else "（gamma %.2f）" % gamma,
+                    fallback.get("reason") or "未知原因")
+            elif not note:
+                note = "纯软件通道：gamma 直接压暗，亮度越低对比度越差"
     else:
         gamma = _overlay_gamma(extra)
         if extra:
@@ -699,11 +741,12 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
     elif capability == "backlight":
         device = (info.get("bl") or {}).get("path")
 
+    mode_label = label if lock == LOCK_SOFTWARE else MODE_LABEL[mode]
     return {
         "name": name,
         "mode": mode,
         "capability": capability,
-        "mode_label": MODE_LABEL[mode],
+        "mode_label": mode_label,
         "label": label,
         "hardware": mode in ("ddc", "backlight"),
         "available": mode != "none",
@@ -716,6 +759,7 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         "overlay_cap": extra_cap,
         "min_value": MIN_VALUE,
         "floor_note": "下限 %d%%：再低在 SDR 下等于黑屏（HDR 关闭后实测）" % MIN_VALUE,
+        "lock": lock,
         "temp": temp,
         "temp_label": "%dK" % temp if temp != TEMP_MAX else "6500K（原生）",
         "temp_gamma": list(_temp_gamma(temp)),
@@ -748,6 +792,7 @@ def summary(outputs: list[dict], details: dict | None = None, refresh: bool = Fa
                 "overlay_ready": False, "overlay_cap": 0,
                 "min_value": MIN_VALUE,
                 "floor_note": "下限 %d%%：再低在 SDR 下等于黑屏（HDR 关闭后实测）" % MIN_VALUE,
+                "lock": None,
                 "temp": TEMP_MAX, "temp_label": "6500K（原生）",
                 "temp_gamma": [1.0, 1.0, 1.0], "temp_ready": False,
                 "temp_note": None, "night_light": _night_light_cached(),
@@ -781,6 +826,9 @@ def _mode_changed(o: dict, details: dict) -> dict | None:
     st = _stored().get(o["name"]) or {}
     if not st:
         return None
+    if lock_of(o["name"]):
+        # 锁定通道后不再「采纳硬件当前值」，否则重启会把软件 80% 拉成硬件 100%
+        return None
     # refresh=True 才会真的去读硬件；否则 _entry 会直接回放记录里的旧值
     entry = _entry(o, details, refresh=True)
     cap = entry.get("capability") or entry["mode"]
@@ -806,12 +854,16 @@ def _mode_changed(o: dict, details: dict) -> dict | None:
     return {"mode": cap, "value": stored_value, "prev": st.get("mode")}
 
 
-def _apply_main(o: dict, mode: str, pct: int, details: dict) -> None:
+def _apply_main(o: dict, mode: str, pct: int, details: dict,
+                verify: bool = True) -> None:
     """下发主通道值（硬件 DDC / 硬件背光 / 纯软件 gamma）。
 
     硬件两条通道写完都读回校验：面板固件可能收下指令却不改值（AOC 关 HDR 后
     就出现过整条 DDC 写不进去的情况），只发不验会让界面显示「已设置」而屏幕没动。
     读回不一致时在同一次调用里还原上一值，并把还原结果写进异常信息。
+
+    verify=False 只给拖动中的实时值用：跳过读回，追求低延迟；松手后的最终值
+    仍走 verify=True，由它负责校验、还原与回落。
     """
     if mode == "ddc":
         disp = _map_displays([o], {o["name"]: (details.get(o["name"]) or {}).get("edid")},
@@ -819,6 +871,10 @@ def _apply_main(o: dict, mode: str, pct: int, details: dict) -> None:
         if not disp or not disp.get("bus"):
             raise BrightError("没找到 %s 对应的 ddcutil 显示器编号" % o["name"])
         bus = disp["bus"]
+        if not verify:
+            _ddc_set(bus, pct, verify=False)
+            _VALUES[o["name"]] = (pct, time.time())
+            return
         before = None
         try:
             before, _mx = _ddc_get(bus)
@@ -842,10 +898,12 @@ def _apply_main(o: dict, mode: str, pct: int, details: dict) -> None:
         bl = backlight_info()
         if not bl:
             raise BrightError("没有可用的 /sys/class/backlight 设备")
+        _backlight_set(bl, pct)
+        if not verify:
+            return
         raw_before = bl.get("cur")
         before = (int(round(raw_before * 100.0 / bl["max"]))
                   if raw_before is not None else None)
-        _backlight_set(bl, pct)
         got = _backlight_read(bl)
         if got is None:
             raise BrightError("背光写入后读回超时（目标 %d%%），无法确认是否生效" % pct)
@@ -921,13 +979,16 @@ def _fallback_to_software(o: dict, pct: int, mode: str, details: dict,
 
 
 def set_value(o: dict, pct: int, details: dict | None = None,
-              extra: int | None = None, allow_clamp: bool = False) -> dict:
+              extra: int | None = None, allow_clamp: bool = False,
+              live: bool = False) -> dict:
     """设置亮度（MIN_VALUE~100）。
 
     extra 语义：None = 不改动已有的软件叠加（硬件回到非最低档时会自动撤销），
     0~100 = 显式指定叠加值；只有硬件已经到下限 MIN_VALUE 才生效，否则忽略并写日志。
     allow_clamp=True 只给启动/重登的恢复路径用：历史记录里可能存着低于下限的值
     （HDR 关闭前 0% 并不黑），那时抬到 MIN_VALUE 并记日志，而不是报错。
+    live=True 是拖动中的实时值：跳过硬件读回与失败回落，只保证低延迟；
+    松手后的最终值用 live=False，仍然完整校验并负责回弹。
     """
     if not isinstance(pct, int) or not (0 <= pct <= 100):
         raise BrightError("亮度必须是 0~100 的整数")
@@ -939,7 +1000,9 @@ def set_value(o: dict, pct: int, details: dict | None = None,
         pct = MIN_VALUE
     if extra is not None and (not isinstance(extra, int) or not (0 <= extra <= 100)):
         raise BrightError("软件叠加必须是 0~100 的整数")
-    details = details if details is not None else _details()
+    if details is None:
+        # 锁软件通道的屏不需要 xrandr --verbose 的色温/EDID 细节，拖动时省掉这一下
+        details = {} if lock_of(o["name"]) == LOCK_SOFTWARE else _details()
     entry = _entry(o, details, refresh=False)
     # 用「探测到的能力」决定怎么下发：上一次硬件写失败（当前 mode=software）时，
     # 用户再拖一次应该重试硬件，而不是永久留在软件回落里。
@@ -952,9 +1015,10 @@ def set_value(o: dict, pct: int, details: dict | None = None,
     prev_extra = _int_extra(stored)
 
     try:
-        _apply_main(o, mode, pct, details)
+        _apply_main(o, mode, pct, details, verify=not live)
     except BrightError as e:
-        if mode == "software":          # 纯软件通道再回落就没得落了
+        if live or mode == "software":
+            # 实时值失败/纯软件通道再回落就没得落了：交给最终值或界面报错
             raise
         return _fallback_to_software(o, pct, mode, details, e, entry.get("value"))
 
@@ -992,10 +1056,11 @@ def set_value(o: dict, pct: int, details: dict | None = None,
         new_extra = 0
 
     _store(o["name"], pct, mode, new_extra)
-    _log("亮度 %s = %d%%（%s%s）" % (
-        o["name"], pct, mode,
-        "，软件叠加 %d%%（gamma %.2f）" % (new_extra, _overlay_gamma(new_extra))
-        if new_extra else ""))
+    if not live:                        # 拖动中的实时值不刷日志，避免每 60ms 一行
+        _log("亮度 %s = %d%%（%s%s）" % (
+            o["name"], pct, mode,
+            "，软件叠加 %d%%（gamma %.2f）" % (new_extra, _overlay_gamma(new_extra))
+            if new_extra else ""))
     return _entry(o, details, refresh=False)
 
 
@@ -1055,6 +1120,40 @@ def set_temp(o: dict, kelvin, details: dict | None = None) -> dict:
     _store(o["name"], 100 if value is None else int(value), mode, extra, temp=temp)
     _log("%s 夜间色温 = %dK（gamma %s，亮度层 %.2f）"
          % (o["name"], temp, _gamma_arg(temp), level))
+    return _entry(o, details, refresh=False)
+
+
+def lock_software(o: dict, details: dict | None = None) -> dict:
+    """把输出钉死在软件通道：立即按落盘值下发 gamma，之后不再调用 ddcutil。
+
+    锁定是用户显式动作，允许在这一刻按需探测一次当前值；锁上以后连 detect 都不跑。
+    """
+    name = o["name"]
+    details = details if details is not None else _details()
+    st = _stored().get(name) or {}
+    value = st.get("value")
+    if value is None:
+        try:
+            value = _entry(o, details, refresh=True).get("value")
+        except BrightError:
+            value = None
+    value = max(MIN_VALUE, min(100, int(value if value is not None else 100)))
+    temp = _int_temp(st)
+    _sw_apply(name, value / 100.0, temp)
+    _store(name, value, "software", 0, temp=temp, lock=LOCK_SOFTWARE)
+    _log("%s 已锁定软件调光 %d%%（此后不再调用 ddcutil）" % (name, value))
+    return _entry(o, details, refresh=False)
+
+
+def unlock_channel(o: dict, details: dict | None = None) -> dict:
+    """解除通道锁定，恢复自动探测；不主动写硬件。"""
+    name = o["name"]
+    details = details if details is not None else _details()
+    st = _stored().get(name) or {}
+    value = max(MIN_VALUE, min(100, int(st.get("value", 100))))
+    mode = st.get("mode") if st.get("mode") in ("software", "ddc", "backlight") else "software"
+    _store(name, value, mode, _int_extra(st), lock=None)
+    _log("%s 已解除通道锁定，恢复自动判断（下次探测按硬件能力决定）" % name)
     return _entry(o, details, refresh=False)
 
 

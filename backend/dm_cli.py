@@ -15,6 +15,8 @@
     dm_cli.py brightness set  DP-0 20 60 硬件到下限后再叠 60% 软件 gamma
     dm_cli.py brightness extra DP-0 60  只调软件叠加层（硬件必须已在 20%）
     dm_cli.py brightness temp DP-0 4500 夜间色温（3000-6500K，6500 = 原生）
+    dm_cli.py brightness lock DP-0 software  锁定软件通道（不再调用 ddcutil）
+    dm_cli.py brightness lock DP-0 auto      解除锁定，恢复自动判断
     dm_cli.py log                   打印最近的操作日志
     dm_cli.py serve [--port N]      启动网页界面
 """
@@ -126,7 +128,9 @@ def brightness_cmd(args: list[str]) -> int:
             if e.get("temp_ready"):
                 val += " %s" % ("6500K" if e.get("temp") == 6500 else "%dK" % e.get("temp"))
             extra = e.get("reason") or e.get("note") or ""
-            print("%-8s %-8s %-22s %s" % (name, val, e.get("label") or e["mode_label"], extra))
+            lock = "（锁定 %s）" % e["lock"] if e.get("lock") else ""
+            print("%-8s %-8s %-22s %s%s" % (
+                name, val, (e.get("label") or e["mode_label"]) + lock, extra))
             if e.get("hint"):
                 print("         需要权限: " + e["hint"].replace("\n", " && "))
         return 0
@@ -150,6 +154,8 @@ def brightness_cmd(args: list[str]) -> int:
             print("警告: " + nl.get("note"))
         if e.get("reason"):
             print("原因: " + e["reason"])
+        if e.get("lock"):
+            print("通道锁定: %s（固定软件通道，不再探测硬件）" % e["lock"])
         if e.get("hint"):
             print("需要权限:\n" + e["hint"])
         return 0
@@ -184,7 +190,20 @@ def brightness_cmd(args: list[str]) -> int:
         print(r["message"])
         return 0
 
-    raise core.DMError("未知 brightness 子命令: %s（可用 list/get/set/extra/temp）" % sub)
+    if sub in ("lock", "unlock"):
+        if len(args) < 2:
+            raise core.DMError("用法: dm_cli.py brightness lock <输出名> [software|auto]")
+        mode = args[2] if len(args) >= 3 else ("software" if sub == "lock" else "auto")
+        if mode in ("auto", "none", "unlock", "null"):
+            r = core.set_brightness_lock(args[1], None)
+        elif mode == "software":
+            r = core.set_brightness_lock(args[1], "software")
+        else:
+            raise core.DMError("锁定模式只支持 software 或 auto")
+        print(r["message"])
+        return 0
+
+    raise core.DMError("未知 brightness 子命令: %s（可用 list/get/set/extra/temp/lock）" % sub)
 
 
 if __name__ == "__main__":

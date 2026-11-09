@@ -269,6 +269,7 @@ let lastSig = null;          // 结构签名：没变化就不重建 DOM，避�
 let brightTimer = {};        // 每块屏的节流定时器
 let brightDraft = {};        // 拖动中的本地值
 let brightSeq = {};          // 每个输出最近一次请求序号，防止旧响应覆盖新值
+let brightLastSent = {};     // 上一次成功下发的值，拖动时相同值不重复发
 let brightErr = {};          // 最近一次失败的提示
 let brightDragging = null;   // 正在拖动的输出名（拖动时不做重建/回写）
 
@@ -621,7 +622,7 @@ function render(force){
 }
 
 /* ---------------- 亮度滑杆 ---------------- */
-const BRIGHT_THROTTLE_MS = 130;   // 拖动时最多每 130ms 提交一次，避免 ddcutil 调用堆积
+const BRIGHT_THROTTLE_MS = 60;   // 拖动时最多每 60ms 提交一次，只发最新值，合并中间值
 
 function buildBright(o){
   const b = state.brightness && state.brightness[o.name];
@@ -648,13 +649,19 @@ function buildBright(o){
                          : (b.reason || '这块屏不支持亮度调节');
   sl.oninput = () => {
     brightDragging = o.name;
-    brightDraft[o.name] = Number(sl.value);
-    head.querySelector('.bval').textContent = sl.value + '%';
-    queueBright(o.name, Number(sl.value));
+    const v = Number(sl.value);
+    brightDraft[o.name] = v;
+    // 乐观更新：先让手柄和数字跟手，请求在后台按 60ms 合并发送
+    head.querySelector('.bval').textContent = v + '%';
+    queueBright(o.name, v);
   };
   sl.onchange = () => {
     brightDragging = null;
-    sendBright(o.name, Number(sl.value));
+    if(brightTimer[o.name]){ clearTimeout(brightTimer[o.name]); brightTimer[o.name] = null; }
+    const v = Number(sl.value);
+    brightDraft[o.name] = v;
+    // 松手：发最终值，后端做完整校验（硬件通道会读回；失败则界面回弹）
+    sendBright(o.name, v, false);
   };
   sl.onclick = ev => ev.stopPropagation();
   wrap.appendChild(sl);
@@ -809,10 +816,12 @@ function buildBright(o){
 
 function queueBright(name, value){
   brightDraft[name] = value;
-  if(brightTimer[name]) return;          // 上一拍还没到，等它统一提交最新值
+  // 和上次成功下发相同的值就不用再发；拖动中每 60ms 最多一拍，期间只保留最新值
+  if(brightTimer[name] || brightLastSent[name] === value) return;
   brightTimer[name] = setTimeout(() => {
     brightTimer[name] = null;
-    sendBright(name, brightDraft[name]);
+    if(brightDragging !== name) return;    // 已松手，交给 onchange 的最终请求
+    sendBright(name, brightDraft[name], true);
   }, BRIGHT_THROTTLE_MS);
 }
 
@@ -862,18 +871,32 @@ async function sendTemp(name, value){
   updateBrightText(name);
 }
 
-async function sendBright(name, value){
+async function sendBright(name, value, live){
   const seq = (brightSeq[name] = (brightSeq[name] || 0) + 1);
   try{
-    const r = await post('/api/brightness', {name, value});
+    const r = await post('/api/brightness', {name, value, live: !!live});
     if(seq !== brightSeq[name]) return;          // 已有更新的请求，丢弃旧结果
     if(!r.ok) throw new Error(r.error || '设置失败');
     if(state && state.brightness && r.brightness) state.brightness[name] = r.brightness;
+    brightLastSent[name] = value;
     delete brightErr[name];
   }catch(e){
     if(seq !== brightSeq[name]) return;
+    if(live){
+      // 拖动中的偶发失败先不打扰用户，松手的最终请求会再完整校验一次
+      return;
+    }
+    // 最终值被拒（例如低于 20）：拉回后端真实值，界面回弹到实际值
     brightErr[name] = e.message;
-    toast(`亮度设置失败：${e.message}`, true);
+    let actual = null;
+    try{
+      const r2 = await fetch('/api/brightness', {cache:'no-store'}).then(x=>x.json());
+      if(r2 && r2.ok && r2.brightness && r2.brightness[name]) actual = r2.brightness[name];
+    }catch(_){ }
+    if(actual && state && state.brightness) state.brightness[name] = actual;
+    const shown = (state && state.brightness && state.brightness[name])
+      ? state.brightness[name].value : null;
+    toast(`亮度设置失败：${e.message}` + (shown !== null ? `（已回到 ${shown}%）` : ''), true);
   }
   updateBrightText(name);
 }
@@ -899,8 +922,10 @@ async function sendBrightExtra(name, value){
 // 叠加滑杆可用性与 gamma、说明文字。不走整卡重建，拖动时手柄不会跳。
 function paintBright(wrap, b){
   if(!b) return;
+  // 拖动中只让本地乐观值说话，别让在途响应的旧值把手柄/数字拽回去
+  const dragging = brightDragging === wrap.dataset.out;
   const val = wrap.querySelector('.bval');
-  if(val) val.textContent = b.value === null ? '-' : b.value + '%';
+  if(val && !dragging) val.textContent = b.value === null ? '-' : b.value + '%';
   const tag = wrap.querySelector('.btag');
   if(tag){
     tag.textContent = b.label || b.mode_label;
@@ -910,7 +935,7 @@ function paintBright(wrap, b){
   if(sl){
     const vmin = Number(b.min_value) || 20;
     sl.min = vmin;
-    if(b.value !== null && Number(sl.value) !== Math.max(vmin, b.value))
+    if(!dragging && b.value !== null && Number(sl.value) !== Math.max(vmin, b.value))
       sl.value = Math.max(vmin, b.value);
   }
   const ov = wrap.querySelector('.bovslider');

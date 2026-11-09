@@ -401,6 +401,22 @@ def snapshot() -> dict:
     }
 
 
+_LIVE_SNAP = {"ts": 0.0, "snap": None}
+
+
+def _snapshot_for_live(ttl: float = 1.0) -> dict:
+    """拖动中的实时亮度只读 1 秒内的布局快照，避免每次拖动都跑两遍 xrandr。
+
+    布局状态在 1 秒内变化对亮度写入没有影响；松手后的最终值仍用全新快照。
+    """
+    now = time.time()
+    if _LIVE_SNAP["snap"] is not None and now - _LIVE_SNAP["ts"] < ttl:
+        return _LIVE_SNAP["snap"]
+    snap = snapshot()
+    _LIVE_SNAP.update(ts=now, snap=snap)
+    return snap
+
+
 def _bbox(outs: list[dict]) -> dict:
     if not outs:
         return {"x": 0, "y": 0, "w": 0, "h": 0}
@@ -621,12 +637,14 @@ def turn_on(name: str, reason: str = "cli") -> dict:
             "message": "已启用 %s（%s）" % (name, src)}
 
 
-def set_brightness(name: str, value, extra=None) -> dict:
+def set_brightness(name: str, value, extra=None, live: bool = False) -> dict:
     """设置亮度（20~100）。通道选择见 dm_brightness.py：硬件背光/DDC 优先，其次软件调光。
 
     下限 20% 是无条件的安全线：SDR 下再低基本等于黑屏（关掉 HDR 的 AOC 实测 0% 直接
     灰屏）。OS 侧读不到显示器 OSD 的 HDR 状态，所以不做「只有非 HDR 才限制」的判断。
     extra 是硬件到下限后的软件叠加层 0~100；None 表示不改动已有叠加。
+    live=True 是滑杆拖动中的实时值：跳过硬件读回校验，牺牲一点确定性换低延迟；
+    松手后的最终值仍走 live=False 的完整校验。
     """
     import dm_brightness
     try:
@@ -646,13 +664,13 @@ def set_brightness(name: str, value, extra=None) -> dict:
         if not 0 <= extra <= 100:
             raise DMError("软件叠加必须在 0~100 之间")
 
-    snap = snapshot()
+    snap = _snapshot_for_live() if live else snapshot()
     o = _find(snap, name)
     if not o["connected"]:
         raise DMError("%s 当前不是 connected（%s）" % (name, o["status"]))
 
     try:
-        entry = dm_brightness.set_value(o, v, extra=extra)
+        entry = dm_brightness.set_value(o, v, extra=extra, live=live)
     except dm_brightness.BrightError as e:
         raise DMError(str(e))
     return {"ok": True, "name": name, "brightness": entry,
@@ -711,6 +729,32 @@ def set_brightness_temp(name: str, kelvin) -> dict:
             "message": "%s 夜间色温已设为 %s（gamma %s）" % (
                 name, entry["temp_label"],
                 ":".join("%.2f" % v for v in entry["temp_gamma"]))}
+
+
+def set_brightness_lock(name: str, lock) -> dict:
+    """通道锁定：lock="software" 钉死软件通道；None/"" 解除锁定。
+
+    锁定值落在亮度持久化文件里，重启后仍然有效。锁成 software 后亮度链路
+    不再调用 ddcutil（不探测、不写、不读）。
+    """
+    if lock not in (None, "", "software"):
+        raise DMError("通道锁定只支持 software 或解除（null）")
+    snap = snapshot()
+    o = _find(snap, name)
+    if not o["connected"]:
+        raise DMError("%s 当前不是 connected（%s）" % (name, o["status"]))
+
+    import dm_brightness
+    try:
+        if lock == "software":
+            entry = dm_brightness.lock_software(o)
+        else:
+            entry = dm_brightness.unlock_channel(o)
+    except dm_brightness.BrightError as e:
+        raise DMError(str(e))
+    return {"ok": True, "name": name, "brightness": entry,
+            "message": ("%s 已锁定软件通道（之后不再调用 ddcutil）" % name
+                        if lock == "software" else "%s 已解除通道锁定" % name)}
 
 
 def brightness_state(refresh: bool = False) -> dict:

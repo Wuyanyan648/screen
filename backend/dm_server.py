@@ -111,10 +111,15 @@ class Handler(SimpleHTTPRequestHandler):
                     if not name:
                         self._json({"ok": False, "error": "缺少输出名"}, 400)
                         return
-                    if "value" in body:
-                        # extra 可选：硬件到底（0）后叠加的软件层
+                    if "lock" in body:
+                        # 通道锁定：software 钉死软件；null 解除。锁定时不再碰 ddcutil
+                        self._json(core.set_brightness_lock(name, body["lock"]))
+                    elif "value" in body:
+                        # extra 可选：硬件到下限后叠加的软件层
+                        # live=true 表示滑杆拖动中的实时值：跳过硬件读回校验，优先低延迟
                         extra = body.get("extra") if "extra" in body else None
-                        self._json(core.set_brightness(name, body["value"], extra))
+                        self._json(core.set_brightness(
+                            name, body["value"], extra, live=bool(body.get("live"))))
                     elif "extra" in body:
                         self._json(core.set_brightness_extra(name, body["extra"]))
                     elif "temp" in body:
