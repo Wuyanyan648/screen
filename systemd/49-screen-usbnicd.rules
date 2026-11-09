@@ -2,7 +2,9 @@
 //
 // 目的：让本机用户 xzh-wuyan 不输密码就能从门户对 usbnicd.service 做
 // start / stop / restart（门户跑在 systemd 用户单元里，没有交互式提权窗口）。
-// 这是唯一被放开的单元与动作；其它 systemd 操作仍然需要认证。
+// 不按 verb 过滤：门户在 start/restart 前会先调用 reset-failed，systemd 对它的
+// polkit verb 与 start 不同，按 verb 白名单会漏掉它导致门户卡在认证上。
+// 这是唯一被放开的单元；其它 systemd 操作仍然需要认证。
 polkit.addRule(function (action, subject) {
   if (action.id !== "org.freedesktop.systemd1.manage-units") {
     return;
@@ -11,10 +13,6 @@ polkit.addRule(function (action, subject) {
     return;
   }
   if (action.lookup("unit") !== "usbnicd.service") {
-    return;
-  }
-  var verb = action.lookup("verb");
-  if (["start", "stop", "restart", "try-restart"].indexOf(verb) < 0) {
     return;
   }
   return polkit.Result.YES;
