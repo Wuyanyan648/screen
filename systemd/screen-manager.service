@@ -1,0 +1,16 @@
+[Unit]
+Description=screen 显示器输出管理（127.0.0.1:8765）
+Documentation=file://@DIR@/README.md
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@
+Environment=PORT=8765
+ExecStart=/usr/bin/python3 @DIR@/backend/dm_server.py --no-browser
+Restart=on-failure
+RestartSec=2
+# 端口已被占用时 dm_server 返回 3：属于「已有实例」，不算失败
+SuccessExitStatus=3
+
+# 不写 [Install]：由登录会话脚本 start-session-services.sh 在 DISPLAY/XAUTHORITY
+# 就绪后执行 systemctl --user start，避免用户管理器早于 X 启动导致 xrandr 失败。

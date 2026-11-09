@@ -1,0 +1,16 @@
+[Unit]
+Description=screen 本机服务门户（127.0.0.1:8760）
+Documentation=file://@DIR@/README.md
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@/portal
+Environment=PORT=8760
+ExecStart=/usr/bin/python3 @DIR@/portal/portal_server.py --no-browser
+Restart=on-failure
+RestartSec=2
+# 端口已被占用时 portal_server 返回 3：属于「已有实例」，不算失败
+SuccessExitStatus=3
+
+[Install]
+WantedBy=default.target

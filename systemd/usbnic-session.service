@@ -1,0 +1,17 @@
+[Unit]
+Description=登录时拉起 usbnicd（系统级 8787 服务）
+Documentation=file://@DIR@/README.md
+# 停止方向：usbnicd 的系统级 drop-in（systemd/usbnicd-session.conf）里写了
+# PartOf=user@1000.service，用户管理器在本会话结束时停止，usbnicd 随之停止并由
+# ExecStop 清理 nftables / 策略路由 / 上位机开启的代理。
+# 这里只负责「登录后再拉起来」，因为上次注销时它已经被停掉了。
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/bin/systemctl start usbnicd.service
+TimeoutStartSec=30
+# 不写 ExecStop：停止交给 usbnicd 自己的 PartOf，避免两处互相抢生命周期。
+
+[Install]
+WantedBy=default.target

@@ -7,6 +7,9 @@
 形态是**常驻的本地小服务**：固定监听 `127.0.0.1:8765`，根路径 `/` 就是界面，
 登录后自动启动，浏览器打开即用；页面每 2 秒自动拉一次状态，不需要手动刷新。
 
+同仓还带一个**本机服务门户**（`portal/`，`127.0.0.1:8760`），把这台机器上几个自建服务
+（包括本工具和 8787 的网络管理）收成一张卡片入口页，见下文「本机服务门户」。
+
 - 当前实测机型：RTX 3060 Laptop，输出 `DP-0`（AOC U27G3X，3840×2160@160，133% 缩放）、
   `DP-4`（内置 BOE 面板，2560×1600@165，133%，**本机当前是 primary**）、
   `HDMI-0`（便携屏，2880×1800@100，114% 缩放）。
@@ -32,8 +35,8 @@
 ```bash
 cd ~/eric/wuyan_github/screen
 
-./install-autostart.sh     # 安装登录自启（写 ~/.config/autostart，无需 sudo）
-./run-service.sh           # 或前台常驻运行（崩溃自动重启，Ctrl-C 退出）
+./install-autostart.sh     # 安装 systemd 用户单元 + 登录自启（无需 sudo）
+./run-service.sh           # 或前台常驻运行（旧方式，崩溃自动重启）
 ./start.sh                 # 或临时前台运行并自动打开浏览器
 ```
 
@@ -41,25 +44,29 @@ cd ~/eric/wuyan_github/screen
 - 端口固定为 `8765`：被占用时服务直接报错退出（退出码 3），**不会再漂移到别的端口**。
   这样书签、自启项、快捷键都指向同一个地址。想临时换端口可以 `PORT=9000 ./start.sh`。
 
-### 常驻与开机自启
+### 常驻与登录自启（systemd 用户单元）
 
 | 方式 | 命令 | 特点 |
 | --- | --- | --- |
-| 登录自启（推荐，已安装） | `./install-autostart.sh` | 写 `~/.config/autostart/screen-manager.desktop`，登录桌面后自动起，随会话环境（DISPLAY/XAUTHORITY）正常 |
-| 手动常驻 | `./run-service.sh` | 前台循环，进程崩溃 2 秒后自动重启；端口已被占用则直接退出 |
+| 登录自启（推荐，已安装） | `./install-autostart.sh` | 写 `~/.config/systemd/user/screen-manager.service` + 登录会话脚本；注销时由 systemd 统一停止 |
+| 手动常驻（旧方式） | `./run-service.sh` | 前台循环、崩溃重启；但它是普通会话进程，注销后可能残留，仅排查时用 |
 | 临时前台 | `./start.sh` | 会打开浏览器，关掉终端服务就停 |
+
+- 状态与日志：`systemctl --user status screen-manager`、`journalctl --user -u screen-manager -n 50`。
+- `Restart=on-failure` 只兜崩溃；**点停止 / `systemctl --user stop` 不会被拉起**。
+- dm_server 必须跑在图形会话的 X11 环境里，所以 unit 不写 `WantedBy=default.target`：
+  由 `autostart/screen-session.desktop` 调 `start-session-services.sh`，在会话就绪后
+  `systemctl --user import-environment DISPLAY XAUTHORITY` 再 `systemctl --user start`。
+- 为什么不继续只用 autostart：本机 `/etc/systemd/logind.conf` 里是注释状态
+  `#KillUserProcesses=no`（默认即 no），autostart 拉起的普通进程在注销时不会被杀，
+  会变成孤儿继续占着 8765；systemd 用户单元在 `user@1000.service` 的 cgroup 里，
+  `Linger=no` 时会话结束随用户管理器一起停掉。详见下文「本机服务门户」里的生命周期说明。
 
 **关闭自启**：
 
 ```bash
-./uninstall-autostart.sh    # 删除自启项，并停掉当前服务（不改动显示布局）
+./uninstall-autostart.sh    # 停单元、删 unit 与登录项，并停掉进程（不改动显示布局）
 ```
-
-为什么选 autostart 而不是用户级 systemd：本工具所有动作都是 `xrandr`，必须跑在
-图形会话的 `DISPLAY=:0` / `Xauthority` 环境里；autostart 由 gnome-session 启动，
-天然带对这套环境，也和本机 8787 那个上位机服务的做法一致。systemd --user 需要手工
-hardcode `DISPLAY` 与 gdm 的 `Xauthority` 路径，换机器/换登录方式容易失效。
-崩溃自愈由 `run-service.sh` 的循环兜底。
 
 ## 界面说明（纯点击，不需要输入任何文字/命令）
 
@@ -285,6 +292,136 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
   2 秒一次的本地 HTTP 请求开销可以忽略，实现只用标准库、断线重连逻辑简单，
   也和 8787 的行为一致。真正昂贵的 `xrandr` 改布局命令只在点按钮时执行。
 
+## 本机服务门户（127.0.0.1:8760）
+
+`portal/` 是一个独立小服务：固定入口页，把本机几个自建服务收成卡片，显示在线/离线、
+最近检测时间、延迟、端口、托管方式，并提供打开 / 启停按钮。它和 8765 同仓但互不依赖，
+门户挂了不影响被管理的服务。
+
+### 端口与启动
+
+- 固定 `127.0.0.1:8760`，被占用时打印原因并以退出码 3 退出（不漂移）。
+- 选 8760 的理由：紧邻 8765 好记；实测 8765、8787 在听、8080 没在跑，8760 空闲；
+  刻意避开这三个端口，谁先起都不会撞。
+- 托管方式与 8765 一致：**systemd 用户单元** `screen-portal.service`（`WantedBy=default.target`），
+  `Restart=on-failure`，登录即起；纯 HTTP，不需要 X11。
+- 手动前台：`./portal/run-portal.sh`（旧方式，崩溃循环重启）；临时：`python3 portal/portal_server.py`。
+
+### 登录后自动打开门户
+
+- `autostart/screen-portal-open.desktop` → `portal/open-portal.sh`：先轮询
+  `http://127.0.0.1:8760/api/status`（最多 15 秒，每 0.5 秒一次）等门户就绪，
+  再用 `xdg-open` 打开；用 `$XDG_RUNTIME_DIR/screen-portal.opened` 标记去重，
+  **同一登录会话只开一次**（实测连跑两次只调用一次 `xdg-open`）。
+- 不想自动打开：删掉 `~/.config/autostart/screen-portal-open.desktop`，或把其中
+  `X-GNOME-Autostart-enabled=true` 改成 `false`；`./uninstall-autostart.sh` 也会删。
+- 注意：`~/.config/autostart/usbnic-host.desktop` 是 8787 自己的登录项，gateway 模式下会另开
+  8787 的页面；如果不想登录后出现两个标签，把那一项也禁用。
+
+### 服务清单：portal/services.json（热加载）
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 唯一标识，前端按它更新卡片、发启停请求 |
+| `name` / `desc` | 是 / 否 | 卡片标题 / 一句话用途 |
+| `url` | 是 | 打开按钮跳转的真实地址，端口也从这里解析 |
+| `health` | 否 | 健康检查路径，默认 `/`；以 `/` 开头按站点根拼，否则相对 `url` 目录，也可写完整 `http(s)://` |
+| `icon` / `color` | 否 | 一个字符/emoji、卡片左侧色条 |
+| `embed` | 否 | 是否提供「在此页内打开」，默认 `false`；**实测无 X-Frame-Options / CSP 才写 true** |
+| `manage` | 否 | `user-unit` / `system-unit` / `external`（只展示、无启停按钮） |
+| `unit` | 托管时必填 | systemd 单元名，如 `screen-manager.service` |
+| `start_on_login` | 否 | 仅展示提示用：下次登录是否会被拉起 |
+| `note` | 否 | 卡片上「单元」标签的悬停说明 |
+
+- 改完保存即生效：探测轮每 5 秒比对 mtime 重读，卡片增删不用重启门户。
+- 模板：[portal/services.example.json](portal/services.example.json)。
+- 停用某个服务：删掉那一项；停整个门户：`systemctl --user disable --now screen-portal`。
+
+### 托管方式与「随会话停止」的实际含义
+
+| 服务 | 端口 | 托管 | 停止后会被拉起吗 |
+| --- | --- | --- | --- |
+| 屏幕输出管理 | 8765 | `screen-manager.service`（systemd **用户**单元） | 不会；下次登录由 `screen-session.desktop` 启动 |
+| 网络管理 usbnicd | 8787 | `usbnicd.service`（systemd **系统**单元，root） | 不会；下次登录由 `usbnic-session.service` 拉起 |
+| iPad IMU 查看器 | 8080 | 未托管（临时进程） | 不会自动启动 |
+
+**8787 为什么不是用户单元**：它的代码在 `~/eric/wuyan_github/usb_wireless_network`，官方启动/停止是
+`scripts/host-start.sh` / `host-stop.sh`，都要 root（`pkexec`/sudo），因为要写 nftables、策略路由、
+TUN、TPROXY，还要读 `/etc/usbnic/hotspot.pass`（0600 root）。实际进程是系统单元 `usbnicd.service`
+（`User=root`、`/usr/bin/python3`、`WorkingDirectory=.../host`、配置 `host/config/host.yaml`、
+日志 `host/data/usbnicd.log`、无 venv）。强行改成 `systemctl --user` 会直接丢功能，所以采用等价方式：
+
+- **保留系统单元**，不碰它的业务代码与依赖；
+- 系统 drop-in 加 `PartOf=user@1000.service`：最后一个会话结束时 `user@1000.service` 停，
+  本服务一起停；`ExecStop` 调用它自己的 `usbnic_host.cleanup --proxy`（与 `host-stop.sh` 的清理等价），
+  释放 nftables / 路由 / 代理；
+- 用户单元 `usbnic-session.service`（oneshot）负责下次登录把它 `systemctl start` 回来；
+- 门户的启停按钮走 `systemctl`（不加 `--user`），需要一条只放行 `usbnicd.service` 的 polkit 规则。
+
+这三件事需要一次性 sudo（脚本只打印、不代跑）：
+
+```bash
+sudo install -D -m 644 ~/eric/wuyan_github/screen/systemd/usbnicd-session.conf \
+  /etc/systemd/system/usbnicd.service.d/10-screen-session.conf
+sudo install -D -m 644 ~/eric/wuyan_github/screen/systemd/49-screen-usbnicd.rules \
+  /etc/polkit-1/rules.d/49-screen-usbnicd.rules
+sudo systemctl daemon-reload
+```
+
+不装也能用：门户照常显示/打开 8787、8765 的停止也正常；只有 8787 的启停按钮会提示
+polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自动停。
+
+**关于 `KillUserProcesses=no`（本机 logind 默认，配置文件里是注释状态）**：
+
+- 它表示注销时**不杀会话里的普通进程**，这些进程会移到 `user-1000.slice` 下继续跑。
+  旧版 `run-service.sh` / `run-portal.sh` 由 autostart 拉起，正是这类进程——注销后会变孤儿，
+  这就是必须改造的原因。
+- 但它**不影响** `user@1000.service`：`Linger=no`（本机实测 `Linger=no`）时，最后一个会话结束，
+  logind 会停掉用户管理器；用户单元都在它的 cgroup 里（`systemctl --user show -p ControlGroup`
+  显示 `user@1000.service/app.slice/...`），所以会一起被停、端口释放。`KillUserProcesses` 管的是
+  会话 scope，不是用户管理器的生死。
+- 若有人执行过 `loginctl enable-linger`（`Linger=yes`），用户管理器会常驻，注销后单元不会停；
+  用 `loginctl disable-linger "$USER"` 恢复。
+- 关机/重启：systemd 按依赖停所有单元（含 `user@1000`），同样会释放。
+- 8787 的系统 drop-in 依赖 `user@1000.service` 这个名字；换用户名或 UID 要同步改 drop-in。
+
+**资源释放怎么算**：端口从 `ss -lntp` 消失、对应 python 进程全部退出（无孤儿）、
+单元状态为 `inactive`。若单元因启动失败累计触发 start limit，状态会是 `failed`：
+门户的「启动/重启」会先 `systemctl reset-failed` 再启动；也可手动
+`systemctl --user reset-failed <unit>`（系统单元去掉 `--user`）。
+
+### 探测与打开方式
+
+- 后端每 5 秒一轮、每个服务一个线程，`urllib` + 1.5 秒超时；前端每 2 秒只读 `/api/status`，
+  **不在浏览器里直连被管理服务**，不受 CORS / 代理干扰。
+- 有 HTTP 响应且状态码 < 500 算在线（4xx 会提示「健康路径是否配错」）；拒绝/超时算离线。
+  探测失败只标红写字，不弹窗、不做任何写操作。
+- 默认新标签页打开。实测 8765、8787 响应头都**没有** `X-Frame-Options` / `Content-Security-Policy`，
+  所以这两项提供「在此页内打开」（整页 iframe + 顶部「← 返回门户 / 新标签页打开」，`Esc` 也可返回）；
+  8080 核查时没在监听，无法核实响应头，`embed: false`，只给新标签页。
+- 离线时「在此页内打开」置灰；启停按钮点击后会在卡片底部显示「最近操作 时间 动作 成功/失败：原因」。
+
+### 要不要做成通用框架？
+
+**结论：就做静态门户 + JSON 清单，不抽框架。** 新增服务已经只需加一段 JSON；
+再往上做注册中心/插件/自服务注册，就要定义协议、生命周期、权限，而本机只有个位数服务。
+真正重复的「探测 + 超时 + 标红」只有几十行，已集中在 `probe_round()`；托管部分也只是
+`systemctl` 薄壳。等出现「十几个服务 + 分组/鉴权/告警」再抽象，那时接口才看得清。
+
+### 验证记录（本机，2026-11-09）
+
+- 门户由 `screen-portal.service` 启动，`/`、`/api/status` 200；三张卡片：
+  8765 在线 200（unit active）、8787 在线 200（unit active）、8080 离线「连接被拒绝」。
+- 门户「停止」8765：端口 8765 立即消失、unit 变 `inactive`、8 秒后仍未被拉起；
+  「启动」后 `/api/state` 回到 200。
+- 停 `screen-portal`：8760 释放、无 `portal_server` 残留，re-start 后 200。
+- 探测翻转：SIGSTOP 8765 后 5 秒内变「离线 / 请求超时 / 1501ms」，SIGCONT 后回到在线；
+  临时在 8080 起真实 `imu_viewer.html` 后变在线（200 / 8ms），停掉后变离线。
+- 自动打开：假 `xdg-open` 记录到一次调用，连跑两次不重复；门户未就绪时会等待重试。
+- **未做/未验证**：8787 的实际「停止→恢复」没有执行——它需要上面三条 sudo 才安全可控，
+  且本会话没有 sudo 密码；其余路径（在线探测、unit 状态、启动按钮）已实测。
+  浏览器自动化环境不可用，页面用 curl/静态检查验证，未采集真实浏览器 console。
+
 ## 运行期文件
 
 | 路径 | 用途 |
@@ -293,7 +430,12 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 | `~/.cache/display-manager.off` | 用户主动关闭的输出名单（供与看门狗共存、界面标注） |
 | `~/.cache/display-manager.log` | 操作日志（含 xrandr 原始 stderr、快捷键注册/触发） |
 | `~/.config/display-manager/config.json` | 闲置阈值（默认 300 秒，0 = 关闭提醒） |
-| `~/.config/autostart/screen-manager.desktop` | 登录自启项（`uninstall-autostart.sh` 可删） |
+| `~/.config/systemd/user/screen-manager.service` | 8765 的用户单元（`install-autostart.sh` 生成） |
+| `~/.config/systemd/user/screen-portal.service` | 8760 门户的用户单元 |
+| `~/.config/systemd/user/usbnic-session.service` | 登录时拉起 8787 的桥单元 |
+| `~/.config/autostart/screen-session.desktop` | 会话就绪后导入 DISPLAY 并启动 8765 单元 |
+| `~/.config/autostart/screen-portal-open.desktop` | 登录后自动打开门户（可删） |
+| `portal/services.json` | 门户的服务清单（改完 5 秒内热加载） |
 | `~/.cache/hdmi-watchdog.layout` | 看门狗的基线，本工具**只读**，用作没有关闭记录时的恢复兜底 |
 
 `.gitignore` 已排除日志、状态、`__pycache__`、截图等运行时产物。
@@ -303,6 +445,7 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 - Python 3.12（本机自带），**只用标准库**：`http.server` / `subprocess` / `ctypes`。
 - 系统库：`libX11.so.6`、`libXdamage.so.1`、`libXss.so.1`（本机已随 GNOME 安装，无需装包）。
 - 不用 sudo，不装 xscreensaver / xprintidle / xdotool / xbindkeys。
+  （例外：8787 的「随会话停止 + 免密启停」需要一次性 sudo drop-in/polkit，见上文，可选。）
 
 ## 已知限制
 
@@ -314,6 +457,8 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 - 内屏（eDP）关闭后理论上存在个别 NVIDIA 机型唤不回来的风险；本机实测可正常恢复
   （见下一节），如果换机器出现唤不回，用 `Ctrl+Alt+Shift+F12` / `dm_cli.py restore-all` /
   `xrandr --output DP-4 --auto` 依次尝试，最坏情况重启图形会话。
+- 8787 是 root 系统单元；不装可选 sudo drop-in 时，注销不会停它，门户里它的启停会因
+  polkit 认证失败（其余服务不受影响）。
 
 ## 验证状态
 
@@ -324,6 +469,8 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
   只有 1 个 `<select>`（闲置阈值），全部操作都是点击。
 - **常驻与自愈**：`run-service.sh` 启动后，`kill -9` 掉 python，4 秒内出现新 pid，
   `/api/state` 立即恢复 200；重复启动第二个实例打印端口占用并以退出码 3 退出。
+  现已迁移到 `screen-manager.service`：`systemctl --user stop` 后端口释放、unit inactive、
+  8 秒内不会被 `Restart=on-failure` 拉起；`start` 后 `/api/state` 200。
 - **页面自动更新与刷新**：不点按钮 5 秒内「更新于」从 21:41:09 → 21:41:17；
   点「刷新」后 21:41:21 并提示「状态已更新」。
 - **HDMI-0 经界面关闭再开启**（浏览器点击，非命令行）：

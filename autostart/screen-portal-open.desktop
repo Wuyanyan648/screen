@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=screen 本机服务门户（自动打开）
+Comment=登录后等门户就绪，用浏览器打开 http://127.0.0.1:8760/（每个会话只开一次）
+Exec=@DIR@/portal/open-portal.sh
+Path=@DIR@
+Terminal=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true

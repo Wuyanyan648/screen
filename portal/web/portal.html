@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本机服务门户</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171c22; --panel2:#1e252d; --line:#2a333d;
+    --text:#e6edf3; --dim:#8b98a5; --on:#3fb950; --off:#f85149; --accent:#58a6ff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,"Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif;
+    font-size:13px;display:flex;flex-direction:column;min-height:100%;
+  }
+  header{
+    display:flex;align-items:center;gap:14px;padding:10px 18px;flex-wrap:wrap;
+    background:var(--panel);border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex;align-items:center;gap:9px}
+  .logo{
+    width:22px;height:22px;border-radius:6px;display:grid;place-items:center;
+    background:#1d2a3a;border:1px solid #2f4a6b;color:var(--accent);font-size:13px;
+  }
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.5px}
+  .spacer{flex:1}
+  .meta{color:var(--dim);font-size:12px}
+  .meta b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+  .conn{
+    font-size:11.5px;padding:2px 9px;border-radius:10px;border:1px solid var(--line);
+    color:var(--dim);white-space:nowrap;
+  }
+  .conn.ok{color:#7ee787;border-color:#2ea043;background:#12281a}
+  .conn.bad{color:#ffb3ad;border-color:#8b2c2c;background:#2a1414}
+  .cfgErr{
+    font-size:11.5px;color:#ffd28a;background:#2b2007;border:1px solid #9e6a03;
+    border-radius:6px;padding:3px 8px;max-width:46vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  button{
+    font:inherit;color:var(--text);background:var(--panel2);
+    border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer;transition:.15s;
+  }
+  button:hover:not(:disabled){background:#26303a;border-color:#3d4956}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.ghost{background:transparent}
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    padding:7px 14px;border-radius:7px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--text);text-decoration:none;cursor:pointer;
+    font-size:12.5px;transition:.15s;white-space:nowrap;
+  }
+  .btn:hover{background:#26303a;border-color:#3d4956}
+  .btn.primary{background:#17351f;border-color:#2ea043;color:#7ee787}
+  .btn.primary:hover{background:#1d4427}
+  main{flex:1;padding:20px 18px 24px;display:flex;flex-direction:column;gap:16px;max-width:1240px;width:100%;margin:0 auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .card{
+    position:relative;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px 16px 14px;display:flex;flex-direction:column;gap:12px;overflow:hidden;
+    transition:border-color .15s,opacity .15s;
+  }
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--c,#58a6ff)}
+  .card.is-offline{opacity:.78}
+  .card.is-offline::before{background:#8b2c2c}
+  .card:hover{border-color:#3d4956}
+  .cardTop{display:flex;align-items:flex-start;gap:11px}
+  .icon{
+    width:38px;height:38px;flex:0 0 38px;border-radius:9px;display:grid;place-items:center;
+    background:color-mix(in srgb,var(--c) 16%,#10151b);
+    border:1px solid color-mix(in srgb,var(--c) 45%,var(--line));font-size:19px;line-height:1;
+  }
+  .titles{flex:1;min-width:0}
+  .titles h2{margin:0 0 3px;font-size:14px;font-weight:600;line-height:1.3}
+  .desc{margin:0;color:var(--dim);font-size:12px;line-height:1.55}
+  .pill{
+    display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:3px 9px;
+    border-radius:999px;border:1px solid var(--line);color:var(--dim);background:#0d1117;
+    white-space:nowrap;flex:0 0 auto;
+  }
+  .pill .dot{width:8px;height:8px;border-radius:50%;background:#39424d}
+  .pill.online{color:#7ee787;border-color:#2ea043;background:#12281a}
+  .pill.online .dot{background:var(--on);box-shadow:0 0 7px var(--on)}
+  .pill.offline{color:#ffb3ad;border-color:#8b2c2c;background:#2a1414}
+  .pill.offline .dot{background:var(--off)}
+  .addr{
+    font-family:ui-monospace,"JetBrains Mono","Cascadia Mono",Menlo,monospace;
+    font-size:11.5px;color:var(--dim);background:#0c1014;border:1px solid var(--line);
+    border-radius:6px;padding:5px 9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .metaRow{display:flex;gap:14px;flex-wrap:wrap;color:var(--dim);font-size:11.5px;min-height:16px}
+  .metaRow b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+  .metaRow .err{color:#ffb3ad}
+  .actions{display:flex;gap:8px;align-items:center;margin-top:auto;flex-wrap:wrap}
+  .actions .btn{flex:1;min-width:120px}
+  .noembed{color:#6e7b88;font-size:11px;line-height:1.45;flex:1}
+  .hostRow{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:11px;color:var(--dim);line-height:1.5}
+  .hostTag{padding:1px 7px;border-radius:4px;border:1px solid var(--line);background:#0d1117;color:#a9b6c2;white-space:nowrap}
+  .hostTag.unit.active{color:#7ee787;border-color:#2ea043;background:#12281a}
+  .hostTag.unit.inactive{color:#ffb3ad;border-color:#8b2c2c;background:#2a1414}
+  .hostTag.unit.failed{color:#ffd28a;border-color:#9e6a03;background:#2b2007}
+  .lastAct{font-size:11px;color:var(--dim);min-height:15px;line-height:1.45;overflow-wrap:anywhere}
+  .lastAct.bad{color:#ffb3ad}
+  .manageBtns{display:flex;gap:6px;flex-wrap:wrap}
+  .btn.sm{flex:0 0 auto;min-width:0;padding:4px 11px;font-size:11.5px}
+  .btn.warn{color:#ffb3ad;border-color:#5a2a2a;background:#241313}
+  .btn.warn:hover{background:#2f1717;border-color:#8b2c2c}
+  .foot{color:var(--dim);font-size:11.5px;line-height:1.7;margin:0;border-top:1px solid var(--line);padding-top:12px}
+  .empty{color:var(--dim);font-size:13px;grid-column:1/-1;padding:30px 4px}
+
+  /* 页内打开 */
+  .viewer{position:fixed;inset:0;z-index:40;display:flex;flex-direction:column;background:var(--bg)}
+  .viewer[hidden]{display:none}
+  .vbar{
+    display:flex;align-items:center;gap:12px;padding:8px 14px;flex-wrap:wrap;
+    background:var(--panel);border-bottom:1px solid var(--line);
+  }
+  .vbar b{font-size:13px;font-weight:600}
+  .vbar code{color:var(--dim);font-size:11.5px;font-family:ui-monospace,Menlo,monospace}
+  #vFrame{flex:1;width:100%;border:0;background:#fff}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">▦</span><h1>本机服务门户</h1></div>
+  <span id="conn" class="conn">连接中…</span>
+  <span id="cfgErr" class="cfgErr" hidden></span>
+  <div class="spacer"></div>
+  <span class="meta">后端每 <b id="interval">—</b> 秒探测 · 最近检测 <b id="lastCheck">—</b></span>
+  <button id="refreshBtn" class="ghost" type="button">立即检测</button>
+</header>
+
+<main>
+  <div id="grid" class="grid"></div>
+  <p class="foot">
+    状态由门户后端定时发 HTTP 请求探测（带 1.5 秒超时），页面只读门户自己的接口，不在浏览器里直连被管理服务。
+    默认「打开」为新标签页；带「在此页内打开」的服务是实测响应头里没有 X-Frame-Options / CSP 的
+    （当前为 8765、8787）；8080 未运行、无法核实响应头，只给新标签页。<br>
+    启动/停止/重启走 systemd：用户单元用 <code>systemctl --user</code>，8787 是系统级 root 单元用
+    <code>systemctl</code>（需一次性 polkit 规则，否则会显示认证失败）。主动「停止」不会被
+    <code>Restart=on-failure</code> 拉起；受管服务在注销/关机时由会话管理器统一停止、释放端口，
+    下次登录由会话启动项拉回来。门户只做旁观与薄壳，挂掉不影响这些服务。
+  </p>
+</main>
+
+<section id="viewer" class="viewer" hidden>
+  <div class="vbar">
+    <button id="backBtn" type="button">← 返回门户</button>
+    <b id="vName"></b>
+    <code id="vUrl"></code>
+    <div class="spacer"></div>
+    <a id="vOpen" class="btn" target="_blank" rel="noopener noreferrer">新标签页打开</a>
+  </div>
+  <iframe id="vFrame" title="服务页面"></iframe>
+</section>
+
+<script>
+(function () {
+  "use strict";
+
+  var POLL_MS = 2000;
+  var state = { sig: "", services: [], inFlight: false, viewer: null, acting: null };
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = text;
+    return n;
+  }
+
+  function setConn(ok) {
+    var c = $("conn");
+    c.className = "conn " + (ok ? "ok" : "bad");
+    c.textContent = ok ? "● 门户已连接" : "● 门户未连接，自动重试中";
+  }
+
+  function buildCard(s) {
+    var card = el("article", "card");
+    card.dataset.id = s.id;
+    card.style.setProperty("--c", s.color || "#58a6ff");
+
+    var top = el("div", "cardTop");
+    var icon = el("div", "icon", s.icon || "•");
+    var titles = el("div", "titles");
+    titles.appendChild(el("h2", "", s.name));
+    titles.appendChild(el("p", "desc", s.desc || ""));
+    var pill = el("span", "pill unknown");
+    pill.appendChild(el("i", "dot"));
+    pill.appendChild(el("span", "ptxt", "检测中"));
+    top.appendChild(icon);
+    top.appendChild(titles);
+    top.appendChild(pill);
+
+    var addr = el("div", "addr", s.url);
+
+    var metaRow = el("div", "metaRow");
+    var tWrap = el("span");
+    tWrap.appendChild(document.createTextNode("最近检测 "));
+    tWrap.appendChild(el("b", "t", "—"));
+    var msWrap = el("span");
+    msWrap.appendChild(document.createTextNode("延迟 "));
+    msWrap.appendChild(el("b", "ms", "—"));
+    metaRow.appendChild(tWrap);
+    metaRow.appendChild(msWrap);
+    metaRow.appendChild(el("span", "err", ""));
+
+    var hostRow = el("div", "hostRow");
+    hostRow.appendChild(el("span", "hostTag", "托管: " + hostLabel(s)));
+    if (s.port) hostRow.appendChild(el("span", "hostTag", "端口 " + s.port));
+    if (s.manage !== "external") hostRow.appendChild(el("span", "hostTag unit", "单元 —"));
+
+    var lastAct = el("div", "lastAct", "");
+
+    var actions = el("div", "actions");
+    var open = el("a", "btn primary", "打开");
+    open.href = s.url;
+    open.target = "_blank";
+    open.rel = "noopener noreferrer";
+    actions.appendChild(open);
+    if (s.embed) {
+      var emb = el("button", "btn ghost embedBtn", "在此页内打开");
+      emb.type = "button";
+      emb.addEventListener("click", function () { openViewer(s.id); });
+      actions.appendChild(emb);
+    } else {
+      actions.appendChild(el("span", "noembed", "未核实可嵌入，仅新标签页打开"));
+    }
+
+    var manageRow = el("div", "manageBtns");
+    if (s.manage !== "external") {
+      [["start", "启动", ""], ["stop", "停止", " warn"], ["restart", "重启", ""]].forEach(function (v) {
+        var b = el("button", "btn sm" + v[2], v[1]);
+        b.type = "button";
+        b.dataset.verb = v[0];
+        b.addEventListener("click", function () { doAction(s.id, v[0]); });
+        manageRow.appendChild(b);
+      });
+    }
+
+    card.appendChild(top);
+    card.appendChild(addr);
+    card.appendChild(metaRow);
+    card.appendChild(hostRow);
+    card.appendChild(lastAct);
+    card.appendChild(actions);
+    if (s.manage !== "external") card.appendChild(manageRow);
+    return card;
+  }
+
+  function hostLabel(s) {
+    if (s.manage === "user-unit") return "systemd 用户单元 " + s.unit;
+    if (s.manage === "system-unit") return "systemd 系统单元 " + s.unit + "（root）";
+    return "未托管（外部进程）";
+  }
+
+  function updateCard(s) {
+    var card = document.querySelector('.card[data-id="' + (window.CSS && CSS.escape ? CSS.escape(s.id) : s.id) + '"]');
+    if (!card) return;
+    var online = s.status === "online";
+    var unknown = s.status === "unknown";
+    card.classList.toggle("is-offline", s.status === "offline");
+
+    var pill = card.querySelector(".pill");
+    pill.className = "pill " + (online ? "online" : unknown ? "unknown" : "offline");
+    pill.querySelector(".ptxt").textContent = online ? "在线" : unknown ? "检测中" : "离线";
+
+    card.querySelector("b.t").textContent = s.last_checked_text || "—";
+    card.querySelector("b.ms").textContent = (s.latency_ms === null || s.latency_ms === undefined)
+      ? "—" : s.latency_ms + " ms";
+    var err = card.querySelector(".err");
+    err.textContent = s.error || "";
+    err.title = s.error || "";
+
+    var unitTag = card.querySelector(".hostTag.unit");
+    if (unitTag) {
+      var us = s.unit_state || "unknown";
+      unitTag.className = "hostTag unit " + us;
+      unitTag.textContent = "单元 " + us;
+      unitTag.title = s.note || "";
+    }
+
+    var last = card.querySelector(".lastAct");
+    if (last) {
+      var a = s.last_action;
+      if (a) {
+        var msg = a.message || "";
+        last.textContent = "最近操作 " + (a.at_text || "") + " " + a.verb + (a.ok ? " 成功" : " 失败")
+          + (msg ? "：" + msg : "");
+        last.title = msg;
+        last.classList.toggle("bad", !a.ok);
+      } else {
+        last.textContent = "";
+        last.classList.remove("bad");
+      }
+    }
+
+    var emb = card.querySelector(".embedBtn");
+    if (emb) {
+      emb.disabled = !online;
+      emb.title = online ? "在这个页面里嵌入显示" : "当前离线，先确认服务在跑";
+    }
+    var busy = state.acting === s.id;
+    card.querySelectorAll(".manageBtns button").forEach(function (b) {
+      b.disabled = busy;
+    });
+  }
+
+  async function doAction(id, verb) {
+    if (state.acting) return;
+    state.acting = id;
+    state.services.forEach(updateCard);
+    try {
+      var resp = await fetch("/api/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: id, verb: verb })
+      });
+      var data = await resp.json();
+      if (data && data.services) {
+        setConn(true);
+        apply(data);
+      } else {
+        setConn(false);
+      }
+    } catch (e) {
+      setConn(false);
+    } finally {
+      state.acting = null;
+      state.services.forEach(updateCard);
+    }
+  }
+
+  function apply(data) {
+    $("lastCheck").textContent = data.checked_text || "—";
+    $("interval").textContent = data.interval || "—";
+    var cfgErr = data.config_error || "";
+    $("cfgErr").hidden = !cfgErr;
+    $("cfgErr").textContent = cfgErr ? ("配置问题：" + cfgErr) : "";
+    $("cfgErr").title = cfgErr;
+
+    var services = data.services || [];
+    var sig = JSON.stringify(services.map(function (s) {
+      return [s.id, s.name, s.desc, s.url, s.icon, s.color, s.embed,
+              s.manage, s.unit, s.note, s.port, s.start_on_login];
+    }));
+    if (sig !== state.sig) {
+      state.sig = sig;
+      var grid = $("grid");
+      grid.replaceChildren.apply(grid, services.map(buildCard));
+      if (!services.length) {
+        grid.appendChild(el("p", "empty", "配置里还没有服务：编辑 portal/services.json 加一项，保存即生效。"));
+      }
+    }
+    state.services = services;
+    services.forEach(updateCard);
+
+    if (state.viewer) {
+      var cur = null;
+      for (var i = 0; i < services.length; i++) {
+        if (services[i].id === state.viewer) { cur = services[i]; break; }
+      }
+      if (cur) syncViewer(cur); else closeViewer();
+    }
+  }
+
+  async function tick(manual) {
+    if (state.inFlight) return;
+    state.inFlight = true;
+    var btn = $("refreshBtn");
+    if (manual) { btn.disabled = true; btn.textContent = "检测中…"; }
+    try {
+      var resp = await fetch(manual ? "/api/refresh" : "/api/status", { cache: "no-store" });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      var data = await resp.json();
+      setConn(true);
+      apply(data);
+    } catch (e) {
+      setConn(false);
+    } finally {
+      state.inFlight = false;
+      if (manual) { btn.disabled = false; btn.textContent = "立即检测"; }
+    }
+  }
+
+  function syncViewer(s) {
+    $("vName").textContent = s.name;
+    $("vUrl").textContent = s.url;
+    $("vOpen").href = s.url;
+  }
+
+  function openViewer(id) {
+    var s = null;
+    for (var i = 0; i < state.services.length; i++) {
+      if (state.services[i].id === id) { s = state.services[i]; break; }
+    }
+    if (!s || !s.embed) return;
+    state.viewer = id;
+    syncViewer(s);
+    $("viewer").hidden = false;
+    document.body.style.overflow = "hidden";
+    $("vFrame").src = s.url;
+  }
+
+  function closeViewer() {
+    if (!state.viewer) return;
+    state.viewer = null;
+    $("viewer").hidden = true;
+    document.body.style.overflow = "";
+    $("vFrame").src = "about:blank";
+  }
+
+  $("backBtn").addEventListener("click", closeViewer);
+  $("refreshBtn").addEventListener("click", function () { tick(true); });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") closeViewer();
+  });
+
+  tick(false);
+  setInterval(function () { tick(false); }, POLL_MS);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+{
+  "_comment": "本机服务门户的服务清单。加服务：复制一段改 id/name/desc/url/health 即可，保存后门户 5 秒内自动热加载，不用重启。manage: user-unit（systemd --user）/ system-unit（systemd 系统级）/ external（只展示）。embed=true 只有在实测该服务没有 X-Frame-Options / CSP 限制时才写。",
+  "services": [
+    {
+      "id": "screen",
+      "name": "屏幕输出管理",
+      "desc": "逐块开关本机显示输出，带布局图、闲置提醒与恢复全部。",
+      "url": "http://127.0.0.1:8765/",
+      "health": "/api/state",
+      "icon": "🖥",
+      "color": "#58a6ff",
+      "embed": true,
+      "manage": "user-unit",
+      "unit": "screen-manager.service",
+      "start_on_login": true,
+      "note": "由登录会话脚本启动；Restart=on-failure，主动 stop 不会被拉起。"
+    },
+    {
+      "id": "usbnic",
+      "name": "网络管理",
+      "desc": "USB 网卡 / 热点 / 代理的上位机控制台（usbnicd 需要 root）。",
+      "url": "http://127.0.0.1:8787/",
+      "health": "/api/health",
+      "icon": "🌐",
+      "color": "#3fb950",
+      "embed": true,
+      "manage": "system-unit",
+      "unit": "usbnicd.service",
+      "start_on_login": true,
+      "note": "系统级 root 单元；注销时随会话停止（需一次性 sudo drop-in），下次登录由 usbnic-session.service 拉起。"
+    },
+    {
+      "id": "imu",
+      "name": "iPad IMU 查看器",
+      "desc": "iPad 惯性传感器实时查看页。未做成常驻服务，没在跑时显示离线属正常。",
+      "url": "http://127.0.0.1:8080/imu_viewer.html",
+      "health": "/imu_viewer.html",
+      "icon": "📱",
+      "color": "#d2a8ff",
+      "embed": false,
+      "manage": "external",
+      "note": "外部临时进程，门户只展示/打开，不托管、不自动拉起。"
+    }
+  ]
+}

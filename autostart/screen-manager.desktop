@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=screen 显示器输出管理
-Comment=常驻本机 127.0.0.1:8765 的显示器输出管理界面（打开浏览器即用）
-Exec=@DIR@/run-service.sh
-Path=@DIR@
-Terminal=false
-NoDisplay=false
-X-GNOME-Autostart-enabled=true

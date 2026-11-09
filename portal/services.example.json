@@ -1,0 +1,19 @@
+{
+  "_comment": "示例模板：复制成 services.json 后按自己的服务改。字段说明见 README「本机服务门户」。id 必须唯一；health 是拼接在 url 后面的健康检查路径，也可以直接写完整 http(s) 地址；embed 只有当实测该服务没有 X-Frame-Options / CSP 限制时才写 true；manage 可选 user-unit / system-unit / external。",
+  "services": [
+    {
+      "id": "example-app",
+      "name": "示例服务",
+      "desc": "一句话说明这个服务是干什么的。",
+      "url": "http://127.0.0.1:9000/",
+      "health": "/health",
+      "icon": "🧩",
+      "color": "#58a6ff",
+      "embed": false,
+      "manage": "user-unit",
+      "unit": "example-app.service",
+      "start_on_login": true,
+      "note": "迁移到 systemd 用户单元后，门户就能 start/stop/restart，并随会话结束停止。"
+    }
+  ]
+}

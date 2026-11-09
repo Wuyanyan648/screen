@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=screen 会话服务
+Comment=登录后导入 DISPLAY/XAUTHORITY 并启动 screen-manager 用户单元
+Exec=@DIR@/start-session-services.sh
+Path=@DIR@
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
