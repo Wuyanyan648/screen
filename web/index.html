@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>显示器输出管理</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171c22; --panel2:#1e252d; --line:#2a333d;
+    --text:#e6edf3; --dim:#8b98a5; --on:#3fb950; --on-dim:#12351f;
+    --off:#f0883e; --danger:#f85149; --accent:#58a6ff; --primary:#d2a8ff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,"Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif;
+    font-size:13px;display:flex;flex-direction:column;
+  }
+  header{
+    display:flex;align-items:center;gap:14px;padding:10px 16px;
+    background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap;
+  }
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.5px}
+  .meta{color:var(--dim);font-size:12px}
+  .meta b{color:var(--text);font-weight:600}
+  .spacer{flex:1}
+  button{
+    font:inherit;color:var(--text);background:var(--panel2);
+    border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer;
+    transition:.15s;
+  }
+  button:hover:not(:disabled){background:#26303a;border-color:#3d4956}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.primary{background:#17351f;border-color:#2ea043;color:#7ee787}
+  button.primary:hover:not(:disabled){background:#1d4427}
+  button.danger{background:#3a1a1a;border-color:#8b2c2c;color:#ff9c96}
+  button.danger:hover:not(:disabled){background:#4c1f1f}
+  button.ghost{background:transparent}
+  main{flex:1;display:flex;min-height:0}
+  #stage{flex:1;min-width:0;display:flex;flex-direction:column;padding:14px 16px;gap:10px}
+  #canvasWrap{
+    flex:1;min-height:220px;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;overflow:hidden;position:relative;
+  }
+  #layout{width:100%;height:100%;display:block}
+  .rbox{cursor:pointer}
+  .rbox rect{transition:.15s}
+  .rbox:hover rect{filter:brightness(1.25)}
+  #offTray{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .chip{
+    display:flex;align-items:center;gap:8px;background:var(--panel);border:1px dashed var(--line);
+    border-radius:8px;padding:6px 10px;color:var(--dim);font-size:12px;
+  }
+  .chip.on-cur{border-color:var(--accent);color:var(--text)}
+  .chip button{padding:3px 9px;font-size:12px}
+  aside{
+    width:330px;flex:0 0 330px;border-left:1px solid var(--line);background:var(--panel);
+    display:flex;flex-direction:column;min-height:0;
+  }
+  .asideScroll{overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+  .card{
+    background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;
+    cursor:pointer;
+  }
+  .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .card h3{margin:0 0 6px;font-size:13px;display:flex;align-items:center;gap:6px}
+  .badge{font-size:11px;font-weight:500;padding:1px 6px;border-radius:10px;border:1px solid var(--line);color:var(--dim)}
+  .badge.live{color:#7ee787;border-color:#2ea043;background:#12281a}
+  .badge.dead{color:#ff9c96;border-color:#8b2c2c;background:#2a1414}
+  .badge.info{color:var(--primary);border-color:#6e40c9;background:#1e1533}
+  .badge.warn{color:#ffd28a;border-color:#9e6a03;background:#2b2007}
+  .kv{display:grid;grid-template-columns:64px 1fr;gap:2px 8px;color:var(--dim);font-size:12px}
+  .kv span:nth-child(even){color:var(--text);font-variant-numeric:tabular-nums}
+  .cardActions{display:flex;gap:8px;margin-top:9px}
+  .cardActions button{flex:1;padding:5px 8px}
+  .help{font-size:11.5px;color:var(--dim);line-height:1.65}
+  .help code{color:#c9d1d9;background:#0d1117;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:11px}
+  #mask{
+    position:fixed;inset:0;background:rgba(3,6,10,.72);display:none;
+    align-items:center;justify-content:center;padding:20px;z-index:50;
+  }
+  #mask.show{display:flex}
+  #modal{
+    width:min(520px,100%);background:#141a20;border:1px solid var(--line);border-radius:12px;
+    padding:18px 20px;box-shadow:0 20px 60px rgba(0,0,0,.6);
+  }
+  #modal h2{margin:0 0 12px;font-size:15px}
+  #modal .rows{display:flex;flex-direction:column;gap:8px;margin:12px 0}
+  .row{display:flex;gap:10px;font-size:12.5px}
+  .row .k{color:var(--dim);width:92px;flex:0 0 92px}
+  .row .v{flex:1;word-break:break-all}
+  .dangerBox{border:1px solid #8b2c2c;background:#2a1414;color:#ffb3ad;border-radius:8px;padding:9px 11px;font-size:12px;line-height:1.6}
+  .warnBox{border:1px solid #9e6a03;background:#2b2007;color:#ffd28a;border-radius:8px;padding:9px 11px;font-size:12px;line-height:1.6}
+  .modalActions{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
+  #toast{
+    position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
+    background:#1f2730;border:1px solid var(--line);border-radius:8px;padding:9px 16px;
+    opacity:0;transition:.25s;pointer-events:none;max-width:min(720px,90vw);font-size:12.5px;z-index:60;
+  }
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  #toast.err{border-color:#8b2c2c;background:#2a1414;color:#ffb3ad}
+  #logBox{
+    display:none;position:fixed;right:16px;bottom:16px;width:min(620px,46vw);max-height:44vh;
+    overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:10px;
+    padding:10px 12px;font:11.5px/1.55 ui-monospace,Menlo,Consolas,monospace;color:#9fb0c0;z-index:40;
+    white-space:pre-wrap;
+  }
+  #logBox.show{display:block}
+</style>
+</head>
+<body>
+<header>
+  <h1>显示器输出管理</h1>
+  <div class="meta">画布 <b id="canvasSize">-</b> ｜ 启用 <b id="enabledCount">-</b> 块 ｜ 状态时间 <b id="stamp">-</b> ｜ 闲置判据 <b id="idleBasis">-</b></div>
+  <div class="spacer"></div>
+  <button id="btnRefresh" class="ghost">刷新</button>
+  <button id="btnRestore" class="ghost">恢复全部</button>
+  <button id="btnLog" class="ghost">日志</button>
+  <label class="meta" style="display:flex;align-items:center;gap:6px">
+    闲置阈值
+    <input type="number" id="threshold" min="30" max="86400" step="30"
+           style="width:78px;background:#0d1117;color:var(--text);border:1px solid var(--line);border-radius:5px;padding:4px 6px;font:inherit;text-align:right">
+    秒
+  </label>
+  <label class="meta" style="display:flex;align-items:center;gap:6px">
+    <input type="checkbox" id="autoRefresh" checked> 自动刷新 2s
+  </label>
+</header>
+
+<main>
+  <div id="stage">
+    <div id="canvasWrap">
+      <svg id="layout" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+    <div id="offTray"></div>
+  </div>
+
+  <aside>
+    <div class="asideScroll" id="cards"></div>
+    <div style="padding:10px 12px;border-top:1px solid var(--line)">
+      <div class="help">
+        命令行同一套逻辑：<br>
+        <code>python3 backend/dm_cli.py list</code><br>
+        <code>python3 backend/dm_cli.py off HDMI-0</code> /
+        <code>on HDMI-0</code><br>
+        <code>python3 backend/dm_cli.py restore-all</code>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<div id="mask">
+  <div id="modal">
+    <h2 id="mTitle">确认关闭</h2>
+    <div class="rows" id="mRows"></div>
+    <div id="mWarn"></div>
+    <div class="modalActions">
+      <button id="mCancel">取消</button>
+      <button id="mOk" class="danger">确认关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<div id="logBox"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let state = null;
+let selected = null;
+let busy = false;
+let dialogOpen = false;
+
+/* ---------------- 数据 ---------------- */
+async function fetchState(){
+  const r = await fetch('/api/state', {cache:'no-store'});
+  const j = await r.json();
+  if(!j.ok) throw new Error(j.error || '读取状态失败');
+  return j;
+}
+
+async function post(url, body){
+  const r = await fetch(url, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body || {})
+  });
+  const j = await r.json().catch(()=>({ok:false,error:'返回不是 JSON'}));
+  if(!r.ok && j.ok !== false) j.ok = false;
+  return j;
+}
+
+function toast(msg, isErr){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(t._tid);
+  t._tid = setTimeout(()=>{ t.className = isErr ? 'err' : ''; }, 5200);
+}
+
+async function refresh(quiet){
+  try{
+    state = await fetchState();
+    // 状态里已不存在的选择清掉
+    if(selected && !state.outputs.some(o=>o.name===selected)) selected = null;
+    render();
+  }catch(e){
+    if(!quiet) toast('刷新失败：' + e.message, true);
+  }
+}
+
+/* ---------------- 渲染布局图 ---------------- */
+function svgEl(tag, attrs){
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for(const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+
+function renderCanvas(){
+  const svg = $('#layout');
+  svg.innerHTML = '';
+  const on = state.outputs.filter(o=>o.enabled);
+  if(!on.length){
+    svg.setAttribute('viewBox', '0 0 100 60');
+    const t = svgEl('text', {x:50,y:32,fill:'#8b98a5','font-size':4,'text-anchor':'middle'});
+    t.textContent = '当前没有任何启用的输出';
+    svg.appendChild(t);
+    return;
+  }
+  const pad = Math.max(...on.map(o=>o.h)) * 0.025;
+  const x0 = Math.min(...on.map(o=>o.x)) - pad;
+  const y0 = Math.min(...on.map(o=>o.y)) - pad;
+  const x1 = Math.max(...on.map(o=>o.x+o.w)) + pad;
+  const y1 = Math.max(...on.map(o=>o.y+o.h)) + pad;
+  svg.setAttribute('viewBox', `${x0} ${y0} ${x1-x0} ${y1-y0}`);
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+  // 画布外框（所有屏的包围盒）
+  const box = state.canvas;
+  svg.appendChild(svgEl('rect', {
+    x: box.x, y: box.y, width: box.w, height: box.h, fill:'none',
+    stroke:'#2a333d', 'stroke-width': pad*0.12, 'stroke-dasharray': `${pad*0.5} ${pad*0.35}`
+  }));
+
+  const overlapped = new Set();
+  (state.overlaps||[]).forEach(o=>{ overlapped.add(o.a); overlapped.add(o.b); });
+
+  for(const o of on){
+    const sel = o.name === selected;
+    const isOv = overlapped.has(o.name);
+    const gw = svgEl('g', {class:'rbox'});
+    const rect = svgEl('rect', {
+      x:o.x, y:o.y, width:o.w, height:o.h, rx:Math.min(o.w,o.h)*0.012,
+      fill: sel ? '#1b3b5c' : '#182129',
+      stroke: isOv ? '#f85149' : (sel ? '#58a6ff' : '#39424d'),
+      'stroke-width': Math.max(2, Math.min(o.w,o.h)*0.004)
+    });
+    rect.addEventListener('click', ()=>{ selected = o.name; render(); });
+    gw.appendChild(rect);
+
+    const fs = Math.max(24, Math.min(96, o.h*0.062));
+    const cx = o.x + o.w/2;
+    let ty = o.y + o.h/2 - fs*1.5;
+    const lines = [
+      {t:o.name + (o.primary ? '  ★ primary' : ''), s:fs*1.35, c:'#e6edf3', w:600},
+      {t:`${o.w}×${o.h}  @ ${o.x},${o.y}`, s:fs*0.8, c:'#9fb0c0'},
+      {t:`${o.mode}  ${o.rate}Hz`, s:fs*0.8, c:'#9fb0c0'},
+      {t:`缩放 ${o.scale ? o.scale.toFixed(0)+'%' : '-'}（transform ${o.transform ? o.transform[0].toFixed(4) : '-'}）`, s:fs*0.8, c:'#9fb0c0'},
+      {t: o.panel ? '内屏 · 已启用' : '已启用', s:fs*0.8, c:'#7ee787'},
+    ];
+    for(const ln of lines){
+      const t = svgEl('text', {
+        x:cx, y:ty, 'text-anchor':'middle', fill:ln.c,
+        'font-size':ln.s, 'font-weight':ln.w||400,
+        'font-family':'"Noto Sans CJK SC",sans-serif'
+      });
+      t.textContent = ln.t;
+      gw.appendChild(t);
+      ty += ln.s*1.45;
+    }
+
+    // 闲置：整块变暗 + 角标（非模态提醒），角标可一键关闭该输出
+    if(o.idle){
+      gw.appendChild(svgEl('rect', {
+        x:o.x, y:o.y, width:o.w, height:o.h, rx:Math.min(o.w,o.h)*0.012,
+        fill:'rgba(4,7,10,.55)', 'pointer-events':'none'
+      }));
+      const bfs = Math.max(18, Math.min(52, o.h*0.034));
+      const label = `闲置 ${fmtDur(o.idle_seconds)}　关闭此输出`;
+      const bw = label.length * bfs * 0.66 + bfs*1.6;
+      const bh = bfs * 1.95;
+      const bx = o.x + o.w - bw - o.w*0.02;
+      const by = o.y + o.h*0.02;
+      const badge = svgEl('g', {style:'cursor:pointer'});
+      badge.appendChild(svgEl('rect', {
+        x:bx, y:by, width:bw, height:bh, rx:bh*0.35,
+        fill:'#3a1a1a', stroke:'#f85149', 'stroke-width':Math.max(2, bfs*0.09)
+      }));
+      const bt = svgEl('text', {
+        x:bx+bw/2, y:by+bh*0.66, 'text-anchor':'middle', fill:'#ffb3ad',
+        'font-size':bfs, 'font-weight':600, 'font-family':'"Noto Sans CJK SC",sans-serif',
+        'pointer-events':'none'
+      });
+      bt.textContent = label;
+      badge.appendChild(bt);
+      badge.addEventListener('click', ev=>{ ev.stopPropagation(); doOff(o.name); });
+      gw.appendChild(badge);
+    }
+    svg.appendChild(gw);
+  }
+}
+
+function fmtCanvas(c){ return c ? `${c.w}×${c.h}` : '-'; }
+
+function fmtDur(sec){
+  if(sec === null || sec === undefined) return '-';
+  sec = Math.round(sec);
+  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  return h ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+           : `${m}:${String(s).padStart(2,'0')}`;
+}
+
+function renderTray(){
+  const tray = $('#offTray');
+  tray.innerHTML = '';
+  const off = state.outputs.filter(o=>o.status==='connected' && !o.enabled);
+  if(!off.length) return;
+  const label = document.createElement('span');
+  label.className = 'meta';
+  label.textContent = '未启用的输出（无几何，不画在图上）：';
+  tray.appendChild(label);
+  for(const o of off){
+    const chip = document.createElement('div');
+    chip.className = 'chip' + (o.name===selected ? ' on-cur' : '');
+    chip.innerHTML = `<span>${o.name}${o.panel?' · 内屏':''}</span>`;
+    const b = document.createElement('button');
+    b.className = 'primary';
+    b.textContent = '开启';
+    b.onclick = e=>{ e.stopPropagation(); doOn(o.name); };
+    chip.appendChild(b);
+    chip.onclick = ()=>{ selected = o.name; render(); };
+    tray.appendChild(chip);
+  }
+}
+
+function renderCards(){
+  const box = $('#cards');
+  box.innerHTML = '';
+  for(const o of state.outputs){
+    if(o.status === 'disconnected') continue;   // 未连接的输出没有可操作价值，略过
+    const card = document.createElement('div');
+    card.className = 'card' + (o.name===selected ? ' sel':'');
+    const badges = [];
+    if(o.enabled) badges.push('<span class="badge live">已启用</span>');
+    else badges.push('<span class="badge dead">已关闭</span>');
+    if(o.primary) badges.push('<span class="badge info">primary</span>');
+    if(o.panel) badges.push('<span class="badge warn">内屏</span>');
+    if(o.off_marked) badges.push('<span class="badge">你关闭的</span>');
+    if(o.idle) badges.push(`<span class="badge dead">闲置 ${fmtDur(o.idle_seconds)}</span>`);
+    card.innerHTML = `<h3>${o.name} ${badges.join('')}</h3>`;
+
+    const kv = document.createElement('div');
+    kv.className = 'kv';
+    const rows = o.enabled ? [
+      ['分辨率', `${o.w}×${o.h}`],
+      ['模式', `${o.mode} @ ${o.rate} Hz`],
+      ['位置', `${o.x}, ${o.y}`],
+      ['缩放', `${o.scale ? o.scale.toFixed(0)+'%' : '-'}`],
+      ['画面静止', o.idle_seconds === null ? '-' : fmtDur(o.idle_seconds)],
+    ] : [['状态', '已关闭，无几何']];
+    kv.innerHTML = rows.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join('');
+    card.appendChild(kv);
+
+    if(o.enabled && o.idle){
+      const hint = document.createElement('div');
+      hint.className = 'help';
+      hint.style.marginTop = '7px';
+      hint.textContent = `这块屏 ${fmtDur(o.idle_seconds)} 没有画面变化，要不要关掉？（判据：${o.idle_basis}）`;
+      card.appendChild(hint);
+    }
+
+    const acts = document.createElement('div');
+    acts.className = 'cardActions';
+    if(o.enabled){
+      const b = document.createElement('button');
+      b.className = 'danger';
+      b.textContent = o.idle ? '关闭此输出' : '关闭';
+      if(o.panel){
+        b.disabled = true;
+        b.title = '内屏（ConnectorType: Panel）不允许从本界面关闭';
+        b.textContent = '内屏不可关闭';
+      }else if(state.enabled_count <= 1){
+        b.disabled = true;
+        b.title = '这是最后一块启用的屏，不能关闭';
+        b.textContent = '关闭（不可用）';
+      }
+      b.onclick = e=>{ e.stopPropagation(); doOff(o.name); };
+      acts.appendChild(b);
+    }else{
+      const b = document.createElement('button');
+      b.className = 'primary';
+      b.textContent = '开启';
+      b.onclick = e=>{ e.stopPropagation(); doOn(o.name); };
+      acts.appendChild(b);
+    }
+    card.appendChild(acts);
+    card.onclick = ()=>{ selected = o.name; render(); };
+    box.appendChild(card);
+  }
+}
+
+function render(){
+  if(!state) return;
+  $('#canvasSize').textContent = fmtCanvas(state.canvas);
+  $('#enabledCount').textContent = state.enabled_count;
+  $('#stamp').textContent = state.time;
+  $('#idleBasis').textContent = state.idle ? state.idle.basis : '-';
+  const th = $('#threshold');
+  if(state.config && document.activeElement !== th) th.value = state.config.idle_threshold;
+  renderCanvas();
+  renderTray();
+  renderCards();
+}
+
+/* ---------------- 操作 ---------------- */
+// 尽力判断某块屏是不是「浏览器窗口所在屏」（X11 下 window.screenX 是屏幕坐标）
+function isBrowserScreen(o){
+  const dpr = window.devicePixelRatio || 1;
+  const pts = [
+    [window.screenX, window.screenY],
+    [window.screenX*dpr, window.screenY*dpr],
+  ];
+  return pts.some(([x,y]) =>
+    x >= o.x && x < o.x + o.w && y >= o.y && y < o.y + o.h);
+}
+
+async function doOff(name){
+  const o = state.outputs.find(x=>x.name===name);
+  if(!o) return;
+  if(o.panel){
+    toast('拒绝关闭：这是笔记本内屏（ConnectorType: Panel），本界面不允许关闭', true);
+    return;
+  }
+  if(state.enabled_count <= 1){
+    toast('拒绝关闭：这是当前唯一启用的输出，关掉后将没有任何画面', true);
+    return;
+  }
+  // 关闭后剩余块数与画布尺寸：先用本地数据算一遍用于确认，服务端会再校验一次
+  const rest = state.outputs.filter(x=>x.enabled && x.name!==name);
+  const c = rest.length ? {
+    w: Math.max(...rest.map(x=>x.x+x.w)) - Math.min(...rest.map(x=>x.x)),
+    h: Math.max(...rest.map(x=>x.y+x.h)) - Math.min(...rest.map(x=>x.y)),
+  } : {w:0,h:0};
+
+  const rows = [
+    ['要关闭', `${name}${o.panel?'（内屏）':''}`],
+    ['关闭后剩余', `${rest.length} 块：${rest.map(x=>x.name).join(', ') || '无'}`],
+    ['画布尺寸', `${fmtCanvas(state.canvas)} → ${rest.length ? fmtCanvas(c) : '无（会拒绝）'}`],
+    ['恢复方式', `<code>python3 ~/eric/wuyan_github/screen/backend/dm_cli.py on ${name}</code>`],
+  ];
+  if(o.idle){
+    rows.splice(1, 0, ['关闭原因', `画面已 ${fmtDur(o.idle_seconds)} 无变化（${o.idle_basis}）`]);
+  }
+  $('#mRows').innerHTML = rows.map(([k,v])=>
+    `<div class="row"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+
+  const warns = [];
+  if(o.panel) warns.push('这是笔记本内屏（ConnectorType: Panel）。');
+  if(isBrowserScreen(o)) warns.push('这个界面所在的屏就是它，关掉后界面会消失，请用上面的命令行恢复，或重新启动界面后点「开启」。');
+  if(o.primary) warns.push('这是 primary 屏，关闭后 primary 会转移。');
+  $('#mWarn').innerHTML = warns.length
+    ? `<div class="dangerBox">⚠ ${warns.join('<br>⚠ ')}</div>` : '';
+
+  dialogOpen = true;
+  $('#mask').classList.add('show');
+  const ok = await new Promise(res=>{
+    $('#mOk').onclick = ()=>{ close(); res(true); };
+    $('#mCancel').onclick = ()=>{ close(); res(false); };
+    $('#mask').onclick = ev=>{ if(ev.target.id==='mask'){ close(); res(false); } };
+    function close(){ dialogOpen = false; $('#mask').classList.remove('show'); }
+  });
+  if(!ok) return;
+
+  busy = true;
+  const r = await post('/api/off', {name});
+  busy = false;
+  if(r.ok){ toast(r.message); if(r.state){ state = r.state; render(); } }
+  else toast('关闭失败：' + (r.error||'未知错误'), true);
+  refresh(true);
+}
+
+async function doOn(name){
+  busy = true;
+  toast(`正在开启 ${name} …`);
+  const r = await post('/api/on', {name});
+  busy = false;
+  if(r.ok){
+    toast((r.message||`已开启 ${name}`) + (r.geometry ? `（${r.geometry}）` : '') +
+          (r.warning ? ' ｜ 注意: ' + r.warning : ''));
+    if(r.state){ state = r.state; render(); }
+  }else{
+    toast('开启失败：' + (r.error||'未知错误'), true);
+  }
+  refresh(true);
+}
+
+async function doRestoreAll(){
+  busy = true;
+  const r = await post('/api/restore', {});
+  busy = false;
+  toast(r.message || (r.ok?'已恢复':'恢复失败'), !r.ok);
+  if(r.state){ state = r.state; render(); }
+  refresh(true);
+}
+
+async function showLog(){
+  const box = $('#logBox');
+  box.classList.toggle('show');
+  if(!box.classList.contains('show')) return;
+  const j = await (await fetch('/api/log')).json();
+  box.textContent = (j.lines||[]).join('\n') || '(暂无日志)';
+}
+
+/* ---------------- 事件 ---------------- */
+$('#btnRefresh').onclick = ()=> refresh(false);
+$('#btnRestore').onclick = ()=> doRestoreAll();
+$('#btnLog').onclick = showLog;
+$('#autoRefresh').onchange = ()=>{ schedule(); };
+$('#threshold').onchange = async e=>{
+  const v = parseInt(e.target.value, 10);
+  if(!Number.isFinite(v)){ toast('阈值需要是整数秒', true); return; }
+  const r = await post('/api/config', {idle_threshold: v});
+  if(r.ok){ toast(`闲置阈值已设为 ${r.config.idle_threshold} 秒`); refresh(true); }
+  else toast('保存失败：' + (r.error||'未知错误'), true);
+};
+document.addEventListener('keydown', e=>{
+  if(e.key === 'r' && !e.metaKey && !e.ctrlKey) refresh(false);
+});
+
+let timer = null;
+function schedule(){
+  clearInterval(timer);
+  if($('#autoRefresh').checked){
+    timer = setInterval(()=>{ if(!dialogOpen && !busy) refresh(true); }, 2000);
+  }
+}
+
+refresh(false);
+schedule();
+</script>
+</body>
+</html>

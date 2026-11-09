@@ -1,0 +1,12 @@
+# 运行时产物（不提交）
+__pycache__/
+*.pyc
+*.pyo
+*.state
+*.layout
+*.log
+*.tmp
+logs/
+cache/
+screenshots/
+.DS_Store
