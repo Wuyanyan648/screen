@@ -301,8 +301,8 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 ### 端口与启动
 
 - 固定 `127.0.0.1:8760`，被占用时打印原因并以退出码 3 退出（不漂移）。
-- 选 8760 的理由：紧邻 8765 好记；实测 8765、8787 在听、8080 没在跑，8760 空闲；
-  刻意避开这三个端口，谁先起都不会撞。
+- 选 8760 的理由：紧邻 8765 好记；实测 8765、8787 在听、8760 空闲；
+  刻意避开这两个端口，谁先起都不会撞。
 - 托管方式与 8765 一致：**systemd 用户单元** `screen-portal.service`（`WantedBy=default.target`），
   `Restart=on-failure`，登录即起；纯 HTTP，不需要 X11。
 - 手动前台：`./portal/run-portal.sh`（旧方式，崩溃循环重启）；临时：`python3 portal/portal_server.py`。
@@ -343,7 +343,6 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 | --- | --- | --- | --- |
 | 屏幕输出管理 | 8765 | `screen-manager.service`（systemd **用户**单元） | 不会；下次登录由 `screen-session.desktop` 启动 |
 | 网络管理 usbnicd | 8787 | `usbnicd.service`（systemd **系统**单元，root） | 不会；下次登录由 `usbnic-session.service` 拉起 |
-| iPad IMU 查看器 | 8080 | 未托管（临时进程） | 不会自动启动 |
 
 **8787 为什么不是用户单元**：它的代码在 `~/eric/wuyan_github/usb_wireless_network`，官方启动/停止是
 `scripts/host-start.sh` / `host-stop.sh`，都要 root（`pkexec`/sudo），因为要写 nftables、策略路由、
@@ -397,8 +396,7 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
 - 有 HTTP 响应且状态码 < 500 算在线（4xx 会提示「健康路径是否配错」）；拒绝/超时算离线。
   探测失败只标红写字，不弹窗、不做任何写操作。
 - 默认新标签页打开。实测 8765、8787 响应头都**没有** `X-Frame-Options` / `Content-Security-Policy`，
-  所以这两项提供「在此页内打开」（整页 iframe + 顶部「← 返回门户 / 新标签页打开」，`Esc` 也可返回）；
-  8080 核查时没在监听，无法核实响应头，`embed: false`，只给新标签页。
+  所以这两项都提供「在此页内打开」（整页 iframe + 顶部「← 返回门户 / 新标签页打开」，`Esc` 也可返回）。
 - 离线时「在此页内打开」置灰；启停按钮点击后会在卡片底部显示「最近操作 时间 动作 成功/失败：原因」。
 
 ### 要不要做成通用框架？
@@ -410,13 +408,13 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
 
 ### 验证记录（本机，2026-11-09）
 
-- 门户由 `screen-portal.service` 启动，`/`、`/api/status` 200；三张卡片：
-  8765 在线 200（unit active）、8787 在线 200（unit active）、8080 离线「连接被拒绝」。
+- 门户由 `screen-portal.service` 启动，`/`、`/api/status` 200；当前登记两张卡片：
+  8765 在线 200（unit active）、8787 在线 200（unit active）。
 - 门户「停止」8765：端口 8765 立即消失、unit 变 `inactive`、8 秒后仍未被拉起；
   「启动」后 `/api/state` 回到 200。
 - 停 `screen-portal`：8760 释放、无 `portal_server` 残留，re-start 后 200。
-- 探测翻转：SIGSTOP 8765 后 5 秒内变「离线 / 请求超时 / 1501ms」，SIGCONT 后回到在线；
-  临时在 8080 起真实 `imu_viewer.html` 后变在线（200 / 8ms），停掉后变离线。
+- 探测翻转：SIGSTOP 8765 后 5 秒内变「离线 / 请求超时 / 1501ms」，SIGCONT 后回到在线
+  （开发期还曾临时登记 8080 做过同样的翻转验证，后来按要求把该项从清单里移除）。
 - 自动打开：假 `xdg-open` 记录到一次调用，连跑两次不重复；门户未就绪时会等待重试。
 - **未做/未验证**：8787 的实际「停止→恢复」没有执行——它需要上面三条 sudo 才安全可控，
   且本会话没有 sudo 密码；其余路径（在线探测、unit 状态、启动按钮）已实测。

@@ -56,7 +56,7 @@
   .btn.primary{background:#17351f;border-color:#2ea043;color:#7ee787}
   .btn.primary:hover{background:#1d4427}
   main{flex:1;padding:20px 18px 24px;display:flex;flex-direction:column;gap:16px;max-width:1240px;width:100%;margin:0 auto}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;max-width:1000px;width:100%;margin:0 auto}
   .card{
     position:relative;background:var(--panel);border:1px solid var(--line);border-radius:12px;
     padding:16px 16px 14px;display:flex;flex-direction:column;gap:12px;overflow:hidden;
@@ -137,7 +137,7 @@
   <p class="foot">
     状态由门户后端定时发 HTTP 请求探测（带 1.5 秒超时），页面只读门户自己的接口，不在浏览器里直连被管理服务。
     默认「打开」为新标签页；带「在此页内打开」的服务是实测响应头里没有 X-Frame-Options / CSP 的
-    （当前为 8765、8787）；8080 未运行、无法核实响应头，只给新标签页。<br>
+    （当前为 8765、8787）。<br>
     启动/停止/重启走 systemd：用户单元用 <code>systemctl --user</code>，8787 是系统级 root 单元用
     <code>systemctl</code>（需一次性 polkit 规则，否则会显示认证失败）。主动「停止」不会被
     <code>Restart=on-failure</code> 拉起；受管服务在注销/关机时由会话管理器统一停止、释放端口，

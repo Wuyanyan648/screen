@@ -28,18 +28,6 @@
       "unit": "usbnicd.service",
       "start_on_login": true,
       "note": "系统级 root 单元；注销时随会话停止（需一次性 sudo drop-in），下次登录由 usbnic-session.service 拉起。"
-    },
-    {
-      "id": "imu",
-      "name": "iPad IMU 查看器",
-      "desc": "iPad 惯性传感器实时查看页。未做成常驻服务，没在跑时显示离线属正常。",
-      "url": "http://127.0.0.1:8080/imu_viewer.html",
-      "health": "/imu_viewer.html",
-      "icon": "📱",
-      "color": "#d2a8ff",
-      "embed": false,
-      "manage": "external",
-      "note": "外部临时进程，门户只展示/打开，不托管、不自动拉起。"
     }
   ]
 }
