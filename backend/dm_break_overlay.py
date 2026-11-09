@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""护眼休息覆盖层（独立进程）：一块屏、无边框、置顶、低刺激。
+"""护眼休息覆盖层（独立进程）：一块屏、无边框、全屏、低刺激。
 
 几何由服务端从 xrandr 的 CRTC 矩形直接传入（--x/--y/--w/--h），
 这里不推算缩放/布局；多屏与分数缩放下位置由调用方保证。
+
+窗口形态（2026-11-10 修正）：必须用「受管全屏窗口」（_NET_WM_STATE_FULLSCREEN），
+不能用 override-redirect 铺满整屏。实测本机 GNOME 46 (X11) + NVIDIA：
+一个铺满整个 X 画布的 override-redirect 窗口会让 mutter 走直通重排路径，并把自己
+~/.config/monitors.xml 里的布局再套一遍，把用户已关闭的 HDMI-0 重新点亮。
+对照实验：受管全屏、或 override-redirect 但不铺满整屏，都不会触发。
 
 视觉规格（刻意做得「无聊」，见 README）：
 - 背景只在 #12161A ~ #1B2328 之间极缓慢过渡（40 秒一个周期，0.8 秒才重绘一次），
@@ -107,8 +113,10 @@ class Overlay:
 
         self.root = tk.Tk()
         self.root.title("护眼休息")
-        self.root.overrideredirect(True)          # X11 override-redirect：WM 不管它，位置精确
+        # 受管全屏（不是 override-redirect）：先按 CRTC 矩形定位，再交给 WM 全屏。
+        # 铺满整屏的 override-redirect 窗口会触发 mutter 重套 monitors.xml（见模块说明）。
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        self.root.attributes("-fullscreen", True)
         self.root.configure(bg=_hex(_tone(BG_TOP, 1.0, self.warm)))
         self.root.attributes("-topmost", True)
 

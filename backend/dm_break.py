@@ -40,6 +40,9 @@ _PROC: subprocess.Popen | None = None
 _THREAD: threading.Thread | None = None
 _STOP = threading.Event()
 _LAST_SAVE = 0.0
+_BASE: dict | None = None      # 休息开始前的布局签名，用于前后比对/兜底
+_LAST_LAYOUT_CHECK = 0.0       # 休息中核对目标屏是否还在的节流时间戳
+LAYOUT_CHECK_EVERY = 5.0       # 休息中每 5 秒确认一次目标屏仍有 CRTC
 
 
 def _iso(ts: float | None = None) -> str:
@@ -258,6 +261,96 @@ def _stop_overlay() -> None:
     _PROC = None
 
 
+def _signature(snap: dict) -> dict:
+    """布局签名：已启用输出、用户关闭名单、画布尺寸。用于休息前后逐项比对。"""
+    return {
+        "enabled": sorted(o["name"] for o in snap["outputs"] if o["enabled"]),
+        "off": sorted(snap.get("off_marked") or []),
+        "canvas": [snap["canvas"]["w"], snap["canvas"]["h"]],
+    }
+
+
+def _guard_layout(label: str, base: dict | None = None) -> list[str]:
+    """复核休息前后布局：把「本该关闭却被外部重新点亮」的输出关回去。
+
+    本服务在休息路径上从不下发 xrandr 布局（只读快照）。但本机实测：
+    mutter 会在特定窗口形态下重套 ~/.config/monitors.xml，把用户已关闭的屏点亮
+    （见 dm_break_overlay.py 头部说明）。这里按休息开始时的快照做兜底，
+    只处理「休息前就在 .off 名单里、现在仍在名单里」的输出——用户主动开启会
+    把它从 .off 移除，因此不会被这里抢回去。
+    """
+    base = base if base is not None else _BASE
+    if not base:
+        return []
+    try:
+        snap = core.snapshot()
+    except Exception as e:
+        core.log("护眼休息：%s 复核布局失败 %r" % (label, e))
+        return []
+    now_off = set(snap.get("off_marked") or [])
+    before_on = set(base["enabled"])
+    fixed = []
+    for o in snap["outputs"]:
+        n = o["name"]
+        if not o["enabled"] or n in before_on:
+            continue
+        if n not in base["off"] or n not in now_off:
+            core.log("护眼休息：%s 发现 %s 被外部启用（不在休息前关闭名单里），"
+                     "按用户设置不动它" % (label, n))
+            continue
+        rc, out, err = core.xrandr(["--output", n, "--off"])
+        if rc == 0:
+            fixed.append(n)
+            core.log("护眼休息：%s 发现 %s 被外部重新点亮，已按休息前状态关回"
+                     "（用户关闭名单未改动）" % (label, n))
+        else:
+            core.log("护眼休息：%s 把 %s 关回失败 rc=%d：%s" % (
+                label, n, rc, (err or out).strip()))
+    after = _signature(core.snapshot())
+    if after["enabled"] != base["enabled"] or after["canvas"] != base["canvas"]:
+        core.log("护眼休息：%s 复核后布局仍与休息前不一致；休息前 %s，现在 %s" % (
+            label, base, after))
+    if after["off"] != base["off"]:
+        core.log("护眼休息：%s 关闭名单发生变化：休息前 %s，现在 %s" % (
+            label, base["off"], after["off"]))
+    return fixed
+
+
+def _schedule_guard(label: str, delays=(1.5, 4.0), base: dict | None = None) -> None:
+    """mutter 重套配置是异步的，休息开始/结束后各查两拍。"""
+    base = base if base is not None else _BASE
+    if not base:
+        return
+
+    def worker():
+        last = 0.0
+        for d in delays:
+            time.sleep(max(0.0, d - last))
+            last = d
+            try:
+                _guard_layout(label, base)
+            except Exception as e:      # 兜底线程不能把异常抛出去
+                core.log("护眼休息：%s 布局复核异常 %r" % (label, e))
+    threading.Thread(target=worker, daemon=True, name="dm-break-guard").start()
+
+
+def _target_alive(st: dict) -> bool:
+    """休息中目标屏被关掉时放弃覆盖（绝不为了覆盖层去点亮任何输出）。"""
+    global _LAST_LAYOUT_CHECK
+    now = time.time()
+    if now - _LAST_LAYOUT_CHECK < LAYOUT_CHECK_EVERY:
+        return True
+    _LAST_LAYOUT_CHECK = now
+    names = [o["name"] for o in core.screen_rects()]
+    if st["screen"] in names:
+        return True
+    core.log("护眼休息：目标屏 %s 在休息期间被关闭，撤销覆盖层并放弃本轮"
+             "（不会重新点亮它）" % st["screen"])
+    _stop_overlay()
+    _end_break("screen-off")
+    return False
+
+
 def _visual(snap: dict | None, name: str) -> tuple[float, float]:
     """覆盖层的文字亮度与暖色程度：跟随当前亮度/色温，只影响这一层画面。"""
     b = ((snap or {}).get("brightness") or {}).get(name) or {}
@@ -329,7 +422,7 @@ def _watch(proc: subprocess.Popen) -> None:
 
 def _end_break(reason: str) -> None:
     """结束当前休息并回到工作计时。reason: done/esc/button/paused/screen-off/error。"""
-    global _PROC
+    global _PROC, _BASE
     st = _STATE
     if st is None or st["phase"] != "break":
         return
@@ -349,6 +442,9 @@ def _end_break(reason: str) -> None:
     st["defer_until"] = 0.0
     st["last_tick"] = time.time()
     _save(st)
+    # 结束后再核一遍：mutter 的重套配置是异步的，覆盖层消失后也可能晚一步生效
+    _schedule_guard("休息结束", base=_BASE)
+    _BASE = None
 
 
 # --------------------------------------------------------------------------- #
@@ -356,6 +452,7 @@ def _end_break(reason: str) -> None:
 # --------------------------------------------------------------------------- #
 def _begin_break(st: dict, now: float) -> None:
     """到点：先看目标屏是否可用、闲置提醒是否在显示，再决定弹出还是延后。"""
+    global _BASE, _LAST_LAYOUT_CHECK
     try:
         snap = core.snapshot()
     except Exception as e:
@@ -367,8 +464,9 @@ def _begin_break(st: dict, now: float) -> None:
         core.log("护眼休息：目标屏 %s 未连接，本轮跳过，回到工作计时" % st["screen"])
         _end_work_skip(st, "screen-off")
         return
-    if not o["enabled"]:
-        core.log("护眼休息：目标屏 %s 已关闭，本轮跳过（回到工作计时）" % st["screen"])
+    if not o["enabled"] or not o.get("crtc"):
+        core.log("护眼休息：目标屏 %s 已关闭（没有 CRTC），本轮跳过，"
+                 "不会为了覆盖而点亮它" % st["screen"])
         _end_work_skip(st, "screen-off")
         return
     if o.get("idle"):
@@ -377,8 +475,12 @@ def _begin_break(st: dict, now: float) -> None:
         core.log("护眼休息：闲置提醒正在显示（%s 已 %.0f 秒无变化），本轮休息延后 %d 秒，"
                  "避免两个覆盖层叠在一起" % (st["screen"], o.get("idle_seconds") or 0, IDLE_RETRY))
         return
+    _BASE = _signature(snap)
+    _LAST_LAYOUT_CHECK = 0.0
     rem = st["break_min"] * 60.0
     _launch(st, o, rem, snap)
+    core.log("护眼休息：休息前布局 %s（休息期间只覆盖已启用输出，不改任何开关）" % (_BASE,))
+    _schedule_guard("覆盖层出现后")
 
 
 def _end_work_skip(st: dict, reason: str) -> None:
@@ -390,6 +492,7 @@ def _end_work_skip(st: dict, reason: str) -> None:
 
 def _resume_break(st: dict, now: float) -> None:
     """服务重启时正处在休息中：按剩余时间重新铺一层，而不是重头开始。"""
+    global _BASE, _LAST_LAYOUT_CHECK
     try:
         snap = core.snapshot()
     except Exception as e:
@@ -397,11 +500,14 @@ def _resume_break(st: dict, now: float) -> None:
         _end_break("error")
         return
     o = next((x for x in snap["outputs"] if x["name"] == st["screen"]), None)
-    if o is None or not o["enabled"]:
+    if o is None or not o["enabled"] or not o.get("crtc"):
         core.log("护眼休息：恢复时目标屏 %s 不可用，本轮跳过" % st["screen"])
         _end_break("screen-off")
         return
+    _BASE = _signature(snap)
+    _LAST_LAYOUT_CHECK = 0.0
     _launch(st, o, st["remaining"], snap)
+    _schedule_guard("恢复覆盖层后")
 
 
 def _tick() -> None:
@@ -421,6 +527,8 @@ def _tick() -> None:
         if running:
             # 覆盖层在跑：服务端同步扣时，只作为「覆盖层卡死」的兜底
             if st["phase"] == "break":
+                if not _target_alive(st):
+                    return
                 st["remaining"] = max(0.0, st["remaining"] - dt)
                 if st["remaining"] <= 0:
                     _stop_overlay()

@@ -605,6 +605,45 @@ python3 backend/dm_cli.py brightness temp  DP-0 4500  # 夜间色温（6500 = �
 - 暂停：工作计时冻结在剩余秒数；暂停时若正在休息，会关掉覆盖层、本轮提前结束并回到完整工作计时。
 - 改工作时长会从新一轮开始计时；改休息时长只影响下一次休息。
 
+### 缺陷修复：休息不得点亮已关闭的输出（2026-11-10）
+
+**现象**：HDMI-0 便携屏在界面里被关闭（`.off` 名单里有它）后触发休息，休息期间它被重新点亮，
+休息结束后一直亮着。预期是「休息只覆盖当前亮着的输出，触发前后任何一路的启用/关闭都不变」。
+
+**根因不在服务下发的 xrandr 布局**：休息路径只调 `core.snapshot()`（`xrandr --current` /
+`--current --verbose`，纯读），没有 `apply_all` / `reapply_for` / `reapply_software` /
+`_mode_changed`；`apply_all()` 与 `reapply_software()` 都显式跳过未启用输出；`_sw_apply`
+对没有 CRTC 的输出只报 `Need crtc`，不会去开它。证据时间线里服务日志没有任何启用记录，
+`.off` 名单也一直写着 HDMI-0——即「名单说关着、机器上却亮着」。
+
+**真正的触发点是覆盖层的窗口形态**：本机 GNOME 46 (X11) + NVIDIA 下，一个**铺满整个 X 画布的
+override-redirect 窗口**会让 mutter 走直通/重排路径，并把自己 `~/.config/monitors.xml` 里的布局
+再套一遍，于是用户已关闭的 HDMI-0 被重新启用（README 里早先记的「mutter 在 RandR 变化后
+有时会重新套用自己的显示配置」就是这个）。对照实验（HDMI-0 先关好，逐个变量试）：
+
+| 变量 | 结果 |
+| --- | --- |
+| 静置 3 分钟 / 只跑 watchdog 的全量重探 `xrandr --query` | 保持 OFF |
+| 受管全屏窗口（`_NET_WM_STATE_FULLSCREEN`） | 保持 OFF |
+| override-redirect，但尺寸 3000×2000（不铺满画布） | 保持 OFF |
+| **override-redirect，铺满 5120×2880 整个画布** | **2 秒内被点亮** |
+
+**修法**：
+
+1. 覆盖层改成**受管全屏窗口**（`attributes("-fullscreen", True)`，去掉 `overrideredirect`）。
+   实测仍精确落在目标屏的 CRTC 矩形（`xwininfo`：`5120x2880+0+0`），双屏都开时也只铺目标屏，
+   ESC 依旧可用（退出码 3）。
+2. 休息开始前记录布局签名（已启用输出、`.off` 名单、画布尺寸），覆盖层出现后 1.5s/4s、
+   休息结束后 1.5s/4s 各复核一次：**只把「休息前就在 `.off` 里、现在仍在 `.off` 里却被点亮」
+   的输出关回去**，不动 `.off` 名单；用户主动开启会先把输出从 `.off` 移除，因此不会被抢回去。
+   布局仍不一致、或名单被外部改动，都会写日志。
+3. 休息中每 5 秒确认目标屏还有 CRTC；一旦被关掉就撤销覆盖层、放弃本轮（`screen-off`），
+   **绝不为了覆盖层去点亮任何输出**。到点时目标屏无 CRTC 同样直接跳过（原有逻辑，补了显式
+   `crtc` 判断和日志）。
+4. watchdog 与 `.off` 名单在这条链路上没有被绕过：`hdmi-watchdog.sh` 的两条恢复分支
+   （HPD 掉线恢复、`FORCE_RECOVER=1` 未掉线兜底）都先查 `is_user_off`，命中就跳过；
+   默认 `FORCE_RECOVER=0`。修完也不再需要和它抢 xrandr：覆盖层不再触发 mutter 重套配置。
+
 ### 视觉规格（低刺激）
 
 - 背景只在 `#12161A` ~ `#1B2328` 之间缓慢过渡（40 秒一个周期，**每 0.8 秒才重绘一次**），
@@ -653,6 +692,39 @@ curl -s -X POST 127.0.0.1:8765/api/break -d '{"screen": "HDMI-0"}'
   闲置消失 → 启动；目标屏关闭 → 记 `screen-off` 并回到工作计时；暂停后剩余秒数不动。
 - 无头 Edge：面板显示 `距下次休息 50 分钟`；把工作改成 25 → 后端 `remaining=1499`；
   点暂停 → 徽标「已暂停」且计时冻结；恢复后 `50/5、enabled=true`。
+
+**端到端回归（2026-11-10 07:23–07:30，真机 HDMI-0 关闭 + 工作 1 分钟）**
+
+前置：界面里关掉 HDMI-0，`~/.cache/display-manager.off = DP-4, HDMI-0`，之后设 `work_min=1`。
+
+触发前 / 连续两个完整休息周期后（07:23:39 → 07:26:39，每 2 秒采样一次）：
+
+```
+触发前   DP-0 ON  HDMI-0 OFF  DP-4 OFF  canvas 5120x2880  off=[DP-4,HDMI-0]
+07:24:00 休息开始（ov=1，倒计时 60s）  HDMI-0 OFF  canvas 5120x2880
+07:24:58 休息结束（倒计时完成）        HDMI-0 OFF  canvas 5120x2880
+07:25:58 第二轮休息开始                HDMI-0 OFF  canvas 5120x2880
+结束     DP-0 ON  HDMI-0 OFF  DP-4 OFF  canvas 5120x2880  off=[DP-4,HDMI-0]
+```
+
+逐项复核（`diff`）：
+
+- `xrandr --current` 的输出行（含几何/位置/gamma 行）：**完全一致**。
+- 各输出启用状态：`DP-0 ON / HDMI-0 OFF / DP-4 OFF`，前后一致。
+- `~/.cache/display-manager.off`：**完全一致**（`DP-4, HDMI-0`）。
+- `~/.config/monitors.xml` mtime：`2026-11-09 04:38:07` 前后未变（mutter 这次没有再改写它）。
+
+补充用例：
+
+- ESC 跳过路径（07:28:52 起休息，07:29:04 发 ESC）：覆盖层退出码 3，跳过后 HDMI-0 仍 OFF，
+  布局行与 `.off` 与触发前完全一致。
+- 兜底复核：休息前记签名 `{'enabled': ['DP-0'], 'off': ['DP-4','HDMI-0']}`，随后外部
+  `xrandr --output HDMI-0 --auto` 点亮，调用 `_guard_layout()` 后日志
+  `发现 HDMI-0 被外部重新点亮，已按休息前状态关回（用户关闭名单未改动）`，
+  HDMI-0 回到 OFF、画布回到 `5120x2880`、`.off` 未变。
+- 双屏都在时（HDMI-0 已启用）跑覆盖层：`xwininfo` 显示窗口仍为 `5120x2880+0+0`，只铺 DP-0，
+  HDMI-0 状态不变。
+
 
 ## 界面把自己的屏关掉了怎么救
 
