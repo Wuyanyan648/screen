@@ -28,6 +28,20 @@
       "unit": "usbnicd.service",
       "start_on_login": true,
       "note": "系统级 root 单元；注销时随会话停止（需一次性 sudo drop-in），下次登录由 usbnic-session.service 拉起。"
+    },
+    {
+      "id": "theme-manager",
+      "name": "配色与字体",
+      "desc": "统一终端 / 桌面 / gedit / Trae 的配色与字体：预设 + 微调 + 一键还原。",
+      "url": "http://127.0.0.1:8790/",
+      "health": "/api/health",
+      "icon": "🎨",
+      "color": "#a371f7",
+      "embed": true,
+      "manage": "user-unit",
+      "unit": "theme-manager.service",
+      "start_on_login": true,
+      "note": "纯用户态 gsettings/dconf + Trae settings.json；应用前自动备份到 ~/.local/share/theme-manager-backup/，可逐份还原。"
     }
   ]
 }
