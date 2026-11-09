@@ -117,6 +117,9 @@ class Handler(SimpleHTTPRequestHandler):
                         self._json(core.set_brightness(name, body["value"], extra))
                     elif "extra" in body:
                         self._json(core.set_brightness_extra(name, body["extra"]))
+                    elif "temp" in body:
+                        # 夜间色温（3000~6500K），走软件 gamma
+                        self._json(core.set_brightness_temp(name, body["temp"]))
                     else:
                         self._json({"ok": False, "error": "缺少亮度值"}, 400)
                 else:

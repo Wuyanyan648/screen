@@ -20,8 +20,18 @@
 - 硬件非 0 时叠加一律撤销并把 gamma 复位 1.0，避免白损失对比度。
 - 硬件写失败回落软件，记录里写 `fallback`，界面/CLI 明示原因。
 
-持久化：~/.cache/display-manager.brightness.json，每块屏记 `{value, mode, extra, time}`，
-硬件与叠加两路值都落盘，服务启动和「关→开」后都会重新下发。
+夜间色温（2026-11-10 起）：AOC 实测 DDC 侧做不了暖色温——capabilities 只给
+01 sRGB / 05 6500K / 06 7500K / 08 9300K / 0b User1，没有 4000K/5000K 档，且
+0x14 / 0x16 / 0x18 / 0x1A 写入全部被显示器忽略（`--noverify` 也一样），capabilities
+里也没有低蓝光 VCP。所以色温只能走软件 gamma 的 R/G/B 三通道比。
+色温与「软件叠加」共用同一块 CRTC gamma 查找表，必须合成**一次** xrandr 调用
+（`--brightness B --gamma r:g:b`）；分两次写会互相覆盖（实测 `--brightness` 会把
+刚设好的 gamma 复位成 1:1:1）。硬件 DDC / 背光通道下色温照常生效（DDC 不动 gamma）。
+GNOME 夜灯改的也是同一块表，两者互斥，界面只警告不覆盖用户设置。
+
+持久化：~/.cache/display-manager.brightness.json，每块屏记
+`{value, mode, extra, temp, time}`，硬件、叠加、色温三路值都落盘，
+服务启动和「关→开」后都会重新下发。
 """
 
 from __future__ import annotations
@@ -109,11 +119,14 @@ def _stored() -> dict:
 
 
 def _store(name: str, value: int, mode: str, extra: int = 0,
-           fallback: dict | None = None) -> None:
+           fallback: dict | None = None, temp: int | None = None) -> None:
     """落盘。value 是主通道值（硬件百分比；纯软件时是 gamma 百分比），
-    extra 是硬件到底后叠加的软件层（0 = 不叠加）。"""
+    extra 是硬件到底后叠加的软件层（0 = 不叠加），temp 是夜间色温（K，6500 = 原生）。
+    temp 不传时沿用上一次记录，避免调亮度顺手把色温清掉。"""
     data = _stored()
+    prev = data.get(name) or {}
     rec = {"value": int(value), "mode": mode, "extra": int(extra),
+           "temp": _int_temp({"temp": temp}) if temp is not None else _int_temp(prev),
            "time": datetime.now().strftime("%F %T")}
     if fallback:
         rec["fallback"] = fallback
@@ -353,12 +366,69 @@ def _ddc_set(bus: str, pct: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 夜间色温 → RGB gamma
+# --------------------------------------------------------------------------- #
+# 6500K 为原生（1:1:1）；往下越暖，逐档压绿和蓝。前三档由实测观感推算，
+# 3000K 为外推值，中间值线性插值。xrandr 的 --gamma 每个通道越小越暗。
+TEMP_MIN, TEMP_MAX = 3000, 6500
+TEMP_POINTS = [
+    (6500, (1.00, 1.00, 1.00)),
+    (5500, (1.00, 0.93, 0.82)),
+    (4500, (1.00, 0.85, 0.68)),
+    (3500, (1.00, 0.78, 0.55)),
+    (3000, (1.00, 0.74, 0.48)),
+]
+
+
+def _clamp_temp(k) -> int:
+    try:
+        k = int(round(float(k)))
+    except (TypeError, ValueError):
+        return TEMP_MAX
+    return max(TEMP_MIN, min(TEMP_MAX, k))
+
+
+def _temp_gamma(k) -> tuple[float, float, float]:
+    """色温（K）→ (R, G, B) gamma 三元组。"""
+    k = _clamp_temp(k)
+    for (k1, g1), (k2, g2) in zip(TEMP_POINTS, TEMP_POINTS[1:]):
+        if k2 <= k <= k1:
+            t = (k1 - k) / float(k1 - k2)
+            return tuple(round(a + (b - a) * t, 2) for a, b in zip(g1, g2))
+    return TEMP_POINTS[-1][1]
+
+
+def _gamma_arg(k) -> str:
+    r, g, b = _temp_gamma(k)
+    return "%.2f:%.2f:%.2f" % (r, g, b)
+
+
+def _int_temp(st: dict) -> int:
+    try:
+        return _clamp_temp((st or {}).get("temp", TEMP_MAX))
+    except (TypeError, ValueError):
+        return TEMP_MAX
+
+
+def _temp_of(name: str) -> int:
+    return _int_temp(_stored().get(name) or {})
+
+
+# --------------------------------------------------------------------------- #
 # 软件调光（xrandr gamma）
 # --------------------------------------------------------------------------- #
-def _sw_apply(name: str, gamma: float) -> None:
-    """直接下发 gamma 值（0.00~1.00）。"""
-    rc, out, err = _run(["xrandr", "--output", name, "--brightness",
-                         "%.2f" % gamma], 10)
+def _sw_apply(name: str, level: float, temp: int | None = None) -> None:
+    """一次 xrandr 调用同时下发亮度与色温。
+
+    两者写的是同一块 CRTC gamma 查找表，分两次调用会互相复位（实测
+    `--brightness` 会把刚设好的色温抹回 1:1:1），所以必须合成一次。
+    level 是整体亮度系数（0.00~1.00），temp 是色温（K，None 表示沿用已落盘的值）。
+    """
+    if temp is None:
+        temp = _temp_of(name)
+    rc, out, err = _run(["xrandr", "--output", name,
+                         "--brightness", "%.2f" % level,
+                         "--gamma", _gamma_arg(temp)], 10)
     if rc != 0:
         detail = (err or out).strip()
         if "Need crtc" in detail:
@@ -366,13 +436,16 @@ def _sw_apply(name: str, gamma: float) -> None:
         raise BrightError("xrandr 设置 gamma 失败：%s" % (detail or "无输出"))
 
 
-def _sw_set(name: str, pct: int) -> None:
-    _sw_apply(name, pct / 100.0)
+def _sw_set(name: str, pct: int, temp: int | None = None) -> None:
+    _sw_apply(name, pct / 100.0, temp)
 
 
-def _sw_reset(name: str) -> None:
-    """切回硬件通道 / 撤销叠加时把 gamma 复位，避免软件层继续压暗。"""
-    _run(["xrandr", "--output", name, "--brightness", "1.0"], 10)
+def _sw_reset(name: str, temp: int | None = None) -> None:
+    """撤销软件压暗（亮度系数回 1.0），但保留夜间色温。"""
+    try:
+        _sw_apply(name, 1.0, temp)
+    except BrightError:
+        pass
 
 
 # 叠加层最多把白光压到 30%（gamma 1.0 → 0.30），对应的对比度损失见 README
@@ -449,6 +522,49 @@ MODE_LABEL = {
     "none": "不支持调节",
 }
 
+# GNOME 夜灯读的是同一块 gamma 表，同时开就会互相覆盖。只读探测 + 10 秒缓存，
+# 只提示、不替用户关。
+_NL = {"info": None, "ts": 0.0}
+_NL_LOCK = threading.Lock()
+
+
+def night_light() -> dict:
+    info = {"available": False, "enabled": False, "temperature": None,
+            "note": "未检测到 GNOME 夜灯（gsettings 不可用）"}
+    exe = shutil.which("gsettings")
+    if not exe:
+        return info
+    rc, out, _ = _run([exe, "get", "org.gnome.settings-daemon.plugins.color",
+                       "night-light-enabled"], 3)
+    if rc != 0:
+        return info
+    info["available"] = True
+    info["enabled"] = out.strip().lower() == "true"
+    rc, out, _ = _run([exe, "get", "org.gnome.settings-daemon.plugins.color",
+                       "night-light-temperature"], 3)
+    # gsettings 输出形如 "uint32 3169"，别把类型前缀当成数值
+    m = re.search(r"uint\d+\s+(\d+)", out or "")
+    if m:
+        info["temperature"] = int(m.group(1))
+    if info["enabled"]:
+        info["note"] = ("GNOME 夜灯已开启（%sK）。它和本页色温改的是同一块 gamma 表，"
+                        "两者会互相覆盖，请二选一：要么关掉夜灯用这里，要么把这里还原成 6500K"
+                        % (info["temperature"] or "?"))
+    else:
+        info["note"] = "GNOME 夜灯未开启，色温由本页独享"
+    return info
+
+
+def _night_light_cached() -> dict:
+    now = time.time()
+    with _NL_LOCK:
+        if _NL["info"] is not None and now - _NL["ts"] < 10:
+            return _NL["info"]
+        info = night_light()
+        _NL["info"] = info
+        _NL["ts"] = now
+        return info
+
 
 def _entry(o: dict, details: dict, refresh: bool) -> dict:
     name = o["name"]
@@ -495,6 +611,17 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
     capability = mode
     probe_value = value       # 硬件实际读到的值，回落时报告的实际通道值会覆盖 value
 
+    # 夜间色温：和亮度共用同一块 gamma 表，最终由 _sw_apply 合成一次下发
+    temp = _int_temp(stored)
+    nl = _night_light_cached()
+    if mode == "none":
+        temp_note = None
+    elif temp == TEMP_MAX:
+        temp_note = "6500K 原生，不改色偏"
+    else:
+        temp_note = ("%dK → gamma %s（只改 R/G/B 比例，对比度影响很小）"
+                     % (temp, _gamma_arg(temp)))
+
     # 叠加层：只有硬件通道、且记录里的通道与当前探测一致时才回放
     extra = 0
     if mode in ("ddc", "backlight") and stored.get("mode") == mode:
@@ -533,7 +660,7 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
             if value == 0:
                 note = "硬件已到最低 0%，还想更暗可拖动「软件叠加」（会压低对比度）"
             elif note is None:
-                note = "纯硬件调节，gamma 1.00（对比度不受影响）"
+                note = "纯硬件调节，不压 gamma（对比度不受影响）"
 
     device = None
     if capability == "ddc":
@@ -554,6 +681,12 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         "extra": extra,
         "gamma": gamma,
         "overlay_ready": mode in ("ddc", "backlight") and value == 0,
+        "temp": temp,
+        "temp_label": "%dK" % temp if temp != TEMP_MAX else "6500K（原生）",
+        "temp_gamma": list(_temp_gamma(temp)),
+        "temp_ready": mode != "none",
+        "temp_note": temp_note,
+        "night_light": nl,
         "fallback": fallback,
         "enabled": bool(o.get("enabled")),
         "device": device,
@@ -578,6 +711,9 @@ def summary(outputs: list[dict], details: dict | None = None, refresh: bool = Fa
                 "label": MODE_LABEL["none"], "hardware": False, "available": False,
                 "value": None, "probe_value": None, "extra": 0, "gamma": None,
                 "overlay_ready": False,
+                "temp": TEMP_MAX, "temp_label": "6500K（原生）",
+                "temp_gamma": [1.0, 1.0, 1.0], "temp_ready": False,
+                "temp_note": None, "night_light": _night_light_cached(),
                 "fallback": None, "enabled": bool(o.get("enabled")), "device": None,
                 "note": None, "reason": "探测异常：%s" % e, "hint": None,
             }
@@ -753,6 +889,32 @@ def set_extra(o: dict, extra: int, details: dict | None = None) -> dict:
     return _entry(o, details, refresh=False)
 
 
+def set_temp(o: dict, kelvin, details: dict | None = None) -> dict:
+    """设置夜间色温（3000~6500K，6500 = 原生）。
+
+    色温走软件 gamma，和硬件 DDC / 背光通道不冲突；与「软件叠加」共用一块
+    gamma 表，所以这里按当前的亮度层算出整体系数，合成一次 xrandr 调用下发。
+    """
+    temp = _clamp_temp(kelvin)
+    details = details if details is not None else _details()
+    entry = _entry(o, details, refresh=False)
+    if entry["mode"] == "none":
+        raise BrightError(entry["reason"] or "这块屏不支持色温调节")
+
+    mode = entry.get("capability") or entry["mode"]
+    value = entry.get("value")
+    extra = int(entry.get("extra") or 0)
+    if mode == "software":
+        level = (100 if value is None else max(0, min(100, value))) / 100.0
+    else:
+        level = _overlay_gamma(extra) if extra else 1.0
+    _sw_apply(o["name"], level, temp)
+    _store(o["name"], 100 if value is None else int(value), mode, extra, temp=temp)
+    _log("%s 夜间色温 = %dK（gamma %s，亮度层 %.2f）"
+         % (o["name"], temp, _gamma_arg(temp), level))
+    return _entry(o, details, refresh=False)
+
+
 def reapply_for(o: dict) -> dict | None:
     """屏幕重新打开后把上次的值再下发一次（gamma 会随模式设置被复位）。"""
     st = _stored().get(o["name"])
@@ -789,13 +951,20 @@ def reapply_software() -> list[str]:
         if not st:
             continue
         extra = _int_extra(st)
+        temp = _int_temp(st)
         try:
             if st.get("mode") == "software":
-                _sw_set(o["name"], int(st.get("value", 100)))
-                done.append(o["name"])
+                _sw_set(o["name"], int(st.get("value", 100)), temp)
+                done.append("%s %d%%%s" % (
+                    o["name"], int(st.get("value", 100)),
+                    "，%dK" % temp if temp != TEMP_MAX else ""))
             elif extra:
-                _sw_apply(o["name"], _overlay_gamma(extra))
-                done.append("%s 叠加 %d%%" % (o["name"], extra))
+                _sw_apply(o["name"], _overlay_gamma(extra), temp)
+                done.append("%s 叠加 %d%%%s" % (
+                    o["name"], extra, "，%dK" % temp if temp != TEMP_MAX else ""))
+            elif temp != TEMP_MAX:
+                _sw_apply(o["name"], 1.0, temp)
+                done.append("%s 色温 %dK" % (o["name"], temp))
         except BrightError as e:
             _log("布局变化后恢复 %s 软件层失败：%s" % (o["name"], e))
     if done:
@@ -837,9 +1006,10 @@ def apply_all() -> list[str]:
             r = set_value(dict(o, _details=details.get(o["name"]) or {}),
                           int(st.get("value", 100)), details,
                           extra=_int_extra(st))
-            msgs.append("%s=%d%%(%s%s)" % (
+            msgs.append("%s=%d%%(%s%s%s)" % (
                 o["name"], r["value"], r["mode"],
-                "，叠加 %d%%" % r["extra"] if r.get("extra") else ""))
+                "，叠加 %d%%" % r["extra"] if r.get("extra") else "",
+                "，色温 %dK" % r["temp"] if r.get("temp", TEMP_MAX) != TEMP_MAX else ""))
         except BrightError as e:
             msgs.append("%s 失败: %s" % (o["name"], e))
     if msgs:

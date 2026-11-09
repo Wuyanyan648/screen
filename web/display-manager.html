@@ -109,6 +109,17 @@
   .bov .brightHead{font-size:11.5px}
   .bovtag{font-size:10.5px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);
     color:var(--dim);font-variant-numeric:tabular-nums}
+  /* 夜间色温（软件 gamma，跟亮度合成一次 xrandr 调用） */
+  .btemp{margin-top:7px;padding-top:6px;border-top:1px dotted var(--line)}
+  .btemp .brightHead{font-size:11.5px}
+  .temptag{font-size:10.5px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);
+    color:var(--dim);font-variant-numeric:tabular-nums}
+  .temptag.warm{color:#ffd28a;border-color:#9e6a03;background:#2b2007}
+  .tempslider::-webkit-slider-thumb{background:#ffb86b}
+  .tempslider::-moz-range-thumb{background:#ffb86b}
+  .temprow{display:flex;align-items:center;gap:8px;margin-top:4px}
+  .temprow button{padding:2px 8px;font-size:11px}
+  .nlwarn{font-size:11px;color:#ffd28a;line-height:1.55;margin-top:4px}
   .bhint{font-size:11px;color:#ffd28a;margin-top:5px}
   .bhint summary{cursor:pointer;outline:none}
   .bhint summary:hover{text-decoration:underline}
@@ -586,7 +597,8 @@ function structuralSig(s){
     // 亮度只放「能力」相关字段；具体数值不进签名，拖动时不重建 DOM
     b: s.brightness ? Object.keys(s.brightness).sort().map(k=>{
       const b = s.brightness[k];
-      return [k, b.mode, b.available, b.mode_label, b.reason];
+      return [k, b.mode, b.available, b.mode_label, b.reason,
+              b.temp_ready, !!(b.night_light && b.night_light.enabled)];
     }) : []
   });
 }
@@ -680,6 +692,68 @@ function buildBright(o){
     wrap.appendChild(ovwrap);
   }
 
+  // 夜间色温：软件 gamma 的 R/G/B 比例，和亮度共用一次 xrandr 调用下发
+  if(b.temp_ready){
+    const tw = document.createElement('div');
+    tw.className = 'btemp';
+    const th = document.createElement('div');
+    th.className = 'brightHead';
+    th.innerHTML = `<span>夜间色温</span><b class="tempval">${tempText(b)}</b>`
+      + `<span class="temptag${isWarm(b) ? ' warm' : ''}">${tempGammaText(b)}</span>`;
+    tw.appendChild(th);
+
+    const ts = document.createElement('input');
+    ts.type = 'range'; ts.className = 'slider tempslider';
+    ts.min = 3000; ts.max = 6500; ts.step = 100;
+    ts.value = b.temp || 6500;
+    ts.title = '往左更暖（数值越小越暖）；6500K = 原生不偏色';
+    ts.oninput = () => {
+      brightDragging = o.name;
+      th.querySelector('.tempval').textContent = ts.value + 'K';
+      queueTemp(o.name, Number(ts.value));
+    };
+    ts.onchange = () => {
+      brightDragging = null;
+      sendTemp(o.name, Number(ts.value));
+    };
+    ts.onclick = ev => ev.stopPropagation();
+    tw.appendChild(ts);
+
+    const row = document.createElement('div');
+    row.className = 'temprow';
+    const reset = document.createElement('button');
+    reset.className = 'ghost';
+    reset.textContent = '还原 6500K';
+    reset.title = '色温还原成原生（gamma 1.00:1.00:1.00）';
+    reset.onclick = ev => {
+      ev.stopPropagation();
+      ts.value = 6500;
+      th.querySelector('.tempval').textContent = '6500K';
+      sendTemp(o.name, 6500);
+    };
+    row.appendChild(reset);
+    const hint = document.createElement('span');
+    hint.className = 'meta';
+    hint.textContent = '只改色偏，不降亮度';
+    row.appendChild(hint);
+    tw.appendChild(row);
+
+    if(b.temp_note){
+      const tn = document.createElement('div');
+      tn.className = 'bnote tempdesc';
+      tn.textContent = b.temp_note;
+      tw.appendChild(tn);
+    }
+    if(b.night_light && b.night_light.enabled){
+      const w = document.createElement('div');
+      w.className = 'nlwarn';
+      w.textContent = '注意：' + (b.night_light.note
+        || 'GNOME 夜灯已开启，和这里改的是同一块 gamma 表，两者会互相覆盖');
+      tw.appendChild(w);
+    }
+    wrap.appendChild(tw);
+  }
+
   if(b.note){
     const n = document.createElement('div');
     n.className = 'bnote bdesc';
@@ -742,6 +816,42 @@ function queueBrightExtra(name, value){
   }, BRIGHT_THROTTLE_MS);
 }
 
+// ---- 夜间色温 ----
+function isWarm(b){ return !!(b && b.temp && b.temp !== 6500); }
+function tempText(b){ return isWarm(b) ? b.temp + 'K' : '6500K'; }
+function tempGammaText(b){
+  if(!isWarm(b)) return '原生';
+  const g = b.temp_gamma || [1, 1, 1];
+  return 'gamma ' + g.map(v => Number(v).toFixed(2)).join(':');
+}
+
+function queueTemp(name, value){
+  const key = name + '#temp';
+  brightDraft[key] = value;
+  if(brightTimer[key]) return;
+  brightTimer[key] = setTimeout(() => {
+    brightTimer[key] = null;
+    sendTemp(name, brightDraft[key]);
+  }, BRIGHT_THROTTLE_MS);
+}
+
+async function sendTemp(name, value){
+  const key = name + '#temp';
+  const seq = (brightSeq[key] = (brightSeq[key] || 0) + 1);
+  try{
+    const r = await post('/api/brightness', {name, temp: value});
+    if(seq !== brightSeq[key]) return;
+    if(!r.ok) throw new Error(r.error || '设置失败');
+    if(state && state.brightness && r.brightness) state.brightness[name] = r.brightness;
+    delete brightErr[name];
+  }catch(e){
+    if(seq !== brightSeq[key]) return;
+    brightErr[name] = e.message;
+    toast(`色温设置失败：${e.message}`, true);
+  }
+  updateBrightText(name);
+}
+
 async function sendBright(name, value){
   const seq = (brightSeq[name] = (brightSeq[name] || 0) + 1);
   try{
@@ -801,6 +911,21 @@ function paintBright(wrap, b){
   }
   const desc = wrap.querySelector('.bdesc');
   if(desc) desc.textContent = b.note || '';
+  // 夜间色温区
+  const tv = wrap.querySelector('.tempval');
+  if(tv) tv.textContent = tempText(b);
+  const ts = wrap.querySelector('.tempslider');
+  if(ts){
+    ts.disabled = !b.temp_ready;
+    if(Number(ts.value) !== Number(b.temp || 6500)) ts.value = b.temp || 6500;
+  }
+  const tt = wrap.querySelector('.temptag');
+  if(tt){
+    tt.textContent = tempGammaText(b);
+    tt.className = 'temptag' + (isWarm(b) ? ' warm' : '');
+  }
+  const td = wrap.querySelector('.tempdesc');
+  if(td) td.textContent = b.temp_note || '';
 }
 
 function updateBrightText(name){

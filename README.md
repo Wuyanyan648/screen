@@ -347,6 +347,45 @@ AOC 的 VCP 10 打到 0 后绝对亮度仍然偏高（压缩在显示器内部�
   `硬件背光`，卡片同样出现叠加滑杆，硬件背光到 0 后可继续叠 gamma；
   便携屏 HDMI-0 是纯软件通道，**不出现**叠加滑杆（主滑杆本身就是 gamma）。
 
+### 夜间色温（2026-11-10）
+
+AOC 实测**DDC 侧做不了暖色温**，所以这一层只能走软件 gamma 的 R/G/B 比例：
+
+- `getvcp 0x14`（Select color preset）的 capabilities 只有 `01 sRGB / 05 6500K / 06 7500K /
+  08 9300K / 0b User 1`，**没有 4000K / 5000K 暖档**；
+- 写 `0x14`（6500K/7500K/sRGB/User1）、`0x16 / 0x18 / 0x1A`（RGB 增益）全部被显示器忽略，
+  读回原值；加 `--noverify` 绕过校验也一样。同一时刻 `0x10` 亮度能正常写入，
+  所以不是总线或权限问题，是这块屏把颜色相关 VCP 锁成只读了。
+- capabilities 里没有任何低蓝光 VCP，OSD 的「低蓝光」是显示器固件内部行为，DDC 侧不可见。
+
+映射（`TEMP_POINTS`，中间值线性插值；6500K = 原生不改）：
+
+| 色温 | R:G:B gamma |
+|---|---|
+| 6500 K | 1.00 : 1.00 : 1.00 |
+| 6000 K | 1.00 : 0.97 : 0.91 |
+| 5500 K | 1.00 : 0.93 : 0.82 |
+| 5000 K | 1.00 : 0.89 : 0.75 |
+| 4500 K | 1.00 : 0.85 : 0.68 |
+| 4000 K | 1.00 : 0.81 : 0.61 |
+| 3500 K | 1.00 : 0.78 : 0.55 |
+| 3000 K | 1.00 : 0.74 : 0.48 |
+
+- **每块屏一条**，不设全局：gamma 是每个 CRTC 自己的查找表，三块屏可以各用各的色温；
+  卡片本来就按输出分，放在同一张卡里也正好和「亮度 / 软件叠加」共用一次下发。
+- **合成一次 xrandr 调用**：`_sw_apply(name, level, temp)` 一次写
+  `--brightness <level> --gamma r:g:b`。`_sw_set` / `_sw_reset` / `reapply_software` /
+  `set_value` / `set_extra` 全部走它，不会出现「先设 gamma 再被 brightness 复位」。
+- **与软件叠加共存**：`level` 由亮度层决定——纯软件屏是 `value/100`；硬件屏是
+  `_overlay_gamma(extra)`（没叠加时 1.0）。色温只改 R/G/B 比例，两者在同一次调用里相乘生效。
+- **硬件 DDC / 背光模式下照常生效**：DDC 不动 gamma，写色温不用碰硬件，也不影响亮度值。
+- **持久化**：`temp` 和 `value` / `mode` / `extra` 一起写进缓存；`reapply_software()` 在布局变化后
+  连同色温一起补回（只有色温、没叠加的屏也会补），`apply_all()` 启动恢复。
+- **与 GNOME 夜灯互斥**：夜灯改的是同一块 CRTC gamma 表，实测夜灯生效时
+  `Gamma: 0.59:1.0:1.6`，我们一次 `--brightness` 就把它复位成 `1:1:1`。所以卡片只**提示**
+  （读到 `night-light-enabled=true` 就显示黄字说明会互相覆盖），不会替用户关掉夜灯。
+  检测走 `gsettings`，10 秒缓存，读不到就当作不可用。
+
 ### 通道切换时不沿用旧百分比
 
 记录里保存了上次的 `mode`。如果探测结果显示通道变了（例如刚装好 ddcutil，从「软件调光 100%」
@@ -365,7 +404,8 @@ AOC 的 VCP 10 打到 0 后绝对亮度仍然偏高（压缩在显示器内部�
 ### 持久化与恢复
 
 - 位置：`~/.cache/display-manager.brightness.json`（每块屏最后一次的
-  `value` / `mode` / `extra` / 时间；`extra` 是硬件到底后的软件叠加层，0 表示不叠加）。
+  `value` / `mode` / `extra` / `temp` / 时间；`extra` 是硬件到底后的软件叠加层，0 表示不叠加；
+  `temp` 是夜间色温 K，6500 表示原生不改）。
 - 服务启动 0.8 秒后由后台线程对**已启用**输出重新下发一次；屏是 `off` 时不应用。
 - 「关闭 → 开启」某块屏后，`on` 成功会立刻再应用一次上次的亮度（模式设置会复位 gamma）。
 - 通道从「软件调光」切到硬件时会把 gamma 复位为 1.0，避免双重压暗；叠加层按记录重放。
@@ -380,12 +420,15 @@ curl -s -X POST -H 'Content-Type: application/json' \
      -d '{"name":"DP-0","value":0,"extra":60}' http://127.0.0.1:8765/api/brightness
 curl -s -X POST -H 'Content-Type: application/json' \
      -d '{"name":"DP-0","extra":60}' http://127.0.0.1:8765/api/brightness   # 只改叠加
+curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"name":"DP-0","temp":4500}' http://127.0.0.1:8765/api/brightness  # 夜间色温 3000~6500K
 
 python3 backend/dm_cli.py brightness                  # 每块屏的通道与当前值
 python3 backend/dm_cli.py brightness get  DP-0        # 走硬件通道时实时读
 python3 backend/dm_cli.py brightness set  DP-0 60     # 0~100
 python3 backend/dm_cli.py brightness set  DP-0 0 60   # 硬件 0 + 叠加 60
 python3 backend/dm_cli.py brightness extra DP-0 60    # 只改叠加（硬件必须已在 0）
+python3 backend/dm_cli.py brightness temp  DP-0 4500  # 夜间色温（6500 = 原生）
 ```
 
 ### 验证记录（本机，2026-11-09）
@@ -426,6 +469,23 @@ python3 backend/dm_cli.py brightness extra DP-0 60    # 只改叠加（硬件必
   （`mode=software` + `fallback` 落盘 + 标签「硬件写失败回落」）、
   再拖主滑杆重试硬件成功后清掉 `fallback`、重启时 `_mode_changed` 采纳硬件真实值
   （用 `probe_value`，不会把回落时的 gamma 当硬件值写回）。
+
+夜间色温验证（2026-11-10，DP-0 真机 + 函数级用例）：
+
+- `POST /api/brightness {"name":"DP-0","temp":4500}` → `xrandr --verbose` 读到
+  `Gamma: 1.0:1.2:1.5`（即下发 `1.00:0.85:0.68`），`getvcp 10` 仍是 `0`；
+  `temp=6500` 还原为 `Gamma: 1.0:1.0:1.0`。
+- 越界 `8000` → `400 {"ok":false,"error":"色温必须在 3000~6500 K 之间"}`；
+  未启用的 DP-4 → `屏已关闭，gamma 调光无法生效`。
+- 函数级（临时 `DM_CACHE_DIR` + 打桩）：`set_temp` 单次调用只发一条 xrandr；
+  硬件 `0 + extra 60 + 4500K` 合并成 `--brightness 0.58 --gamma 1.00:0.85:0.68`；
+  硬件回到 30% 撤销叠加时仍保留色温；`3000K + extra 100` 合并成
+  `--brightness 0.30 --gamma 1.00:0.74:0.48`；调亮度/叠加都不会把 `temp` 清回 6500。
+- 无头浏览器：卡片渲染「夜间色温 6500K / 原生」、滑杆 `min=3000 max=6500 step=100`、
+  「还原 6500K」按钮；只有 `temp_ready` 的屏出现这一块。
+- 夜灯互斥：临时打开 GNOME 夜灯后 `Gamma: 0.59:1.0:1.6`，一次 `--brightness` 即被复位成
+  `1:1:1`；卡片出现黄字「注意：GNOME 夜灯已开启（3169K）……请二选一」。测完已把夜灯关回
+  `false`、色温还原 6500K，屏幕状态与测试前一致。
 
 ## 界面把自己的屏关掉了怎么救
 

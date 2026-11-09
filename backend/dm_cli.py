@@ -14,6 +14,7 @@
     dm_cli.py brightness set  DP-0 60   设置亮度（0-100）
     dm_cli.py brightness set  DP-0 0 60 硬件到底后再叠 60% 软件 gamma
     dm_cli.py brightness extra DP-0 60  只调软件叠加层（硬件必须已在 0）
+    dm_cli.py brightness temp DP-0 4500 夜间色温（3000-6500K，6500 = 原生）
     dm_cli.py log                   打印最近的操作日志
     dm_cli.py serve [--port N]      启动网页界面
 """
@@ -122,6 +123,8 @@ def brightness_cmd(args: list[str]) -> int:
             val = "-" if e["value"] is None else "%d%%" % e["value"]
             if e.get("extra"):
                 val += " +%d%%" % e["extra"]
+            if e.get("temp_ready"):
+                val += " %s" % ("6500K" if e.get("temp") == 6500 else "%dK" % e.get("temp"))
             extra = e.get("reason") or e.get("note") or ""
             print("%-8s %-8s %-22s %s" % (name, val, e.get("label") or e["mode_label"], extra))
             if e.get("hint"):
@@ -138,6 +141,13 @@ def brightness_cmd(args: list[str]) -> int:
         if e.get("extra"):
             val += " + 软件叠加 %d%%（gamma %s）" % (e["extra"], e.get("gamma"))
         print("%s 亮度 %s（%s）" % (name, val, e.get("label") or e["mode_label"]))
+        if e.get("temp_ready"):
+            print("夜间色温 %s（gamma %s）" % (
+                e.get("temp_label"),
+                ":".join("%.2f" % v for v in (e.get("temp_gamma") or []))))
+        nl = e.get("night_light") or {}
+        if nl.get("enabled"):
+            print("警告: " + nl.get("note"))
         if e.get("reason"):
             print("原因: " + e["reason"])
         if e.get("hint"):
@@ -165,7 +175,15 @@ def brightness_cmd(args: list[str]) -> int:
         print(r["message"])
         return 0
 
-    raise core.DMError("未知 brightness 子命令: %s（可用 list/get/set/extra）" % sub)
+    if sub in ("temp", "kelvin", "warm"):
+        if len(args) < 3:
+            raise core.DMError("用法: dm_cli.py brightness temp <输出名> <3000-6500>"
+                               "（6500 = 原生不偏色）")
+        r = core.set_brightness_temp(args[1], args[2])
+        print(r["message"])
+        return 0
+
+    raise core.DMError("未知 brightness 子命令: %s（可用 list/get/set/extra/temp）" % sub)
 
 
 if __name__ == "__main__":

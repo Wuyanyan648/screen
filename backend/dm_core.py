@@ -679,6 +679,31 @@ def set_brightness_extra(name: str, extra) -> dict:
                 name, entry["extra"], entry.get("label") or entry["mode_label"])}
 
 
+def set_brightness_temp(name: str, kelvin) -> dict:
+    """设置夜间色温（3000~6500K，6500 = 原生）。走软件 gamma，与硬件亮度不冲突。"""
+    try:
+        k = int(kelvin)
+    except (TypeError, ValueError):
+        raise DMError("色温必须是 3000~6500 的整数（单位 K）")
+    if not 3000 <= k <= 6500:
+        raise DMError("色温必须在 3000~6500 K 之间")
+
+    snap = snapshot()
+    o = _find(snap, name)
+    if not o["connected"]:
+        raise DMError("%s 当前不是 connected（%s）" % (name, o["status"]))
+
+    import dm_brightness
+    try:
+        entry = dm_brightness.set_temp(o, k)
+    except dm_brightness.BrightError as e:
+        raise DMError(str(e))
+    return {"ok": True, "name": name, "brightness": entry,
+            "message": "%s 夜间色温已设为 %s（gamma %s）" % (
+                name, entry["temp_label"],
+                ":".join("%.2f" % v for v in entry["temp_gamma"]))}
+
+
 def brightness_state(refresh: bool = False) -> dict:
     """亮度总览；refresh=True 时强制重读硬件值（ddcutil getvcp / sysfs / gamma）。"""
     snap = snapshot()
