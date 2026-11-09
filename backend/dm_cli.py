@@ -9,6 +9,9 @@
     dm_cli.py toggle HDMI-0
     dm_cli.py restore-all           恢复所有有记录/有看门狗基线的屏
     dm_cli.py plan  HDMI-0          只看关闭后的后果，不动手
+    dm_cli.py brightness            列出每块屏的亮度与调光通道
+    dm_cli.py brightness get  DP-0  读取某块屏当前亮度（硬件通道会实时读）
+    dm_cli.py brightness set  DP-0 60   设置亮度（0-100）
     dm_cli.py log                   打印最近的操作日志
     dm_cli.py serve [--port N]      启动网页界面
 """
@@ -77,6 +80,9 @@ def main(argv: list[str]) -> int:
             print(core.describe(r["state"]))
             return 0 if r["ok"] else 1
 
+        if cmd == "brightness":
+            return brightness_cmd(args)
+
         if cmd == "log":
             for line in core.read_log_tail(int(args[0]) if args else 40):
                 print(line)
@@ -101,6 +107,45 @@ def need_name(args: list[str], cmd: str) -> str:
     if not args:
         raise core.DMError("用法: dm_cli.py %s <输出名>（先用 list 查看输出名）" % cmd)
     return args[0]
+
+
+def brightness_cmd(args: list[str]) -> int:
+    sub = args[0] if args else "list"
+    if sub in ("list", "ls"):
+        items = core.brightness_state()
+        if not items:
+            print("没有已连接的输出")
+            return 0
+        for name, e in items.items():
+            val = "-" if e["value"] is None else "%d%%" % e["value"]
+            extra = e.get("reason") or e.get("note") or ""
+            print("%-8s %-5s %-22s %s" % (name, val, e["mode_label"], extra))
+            if e.get("hint"):
+                print("         需要权限: " + e["hint"].replace("\n", " && "))
+        return 0
+
+    if sub == "get":
+        name = need_name(args[1:], "brightness get")
+        items = core.brightness_state(refresh=True)
+        e = items.get(name)
+        if not e:
+            raise core.DMError("找不到输出 %s（或它没有连接）" % name)
+        val = "-" if e["value"] is None else "%d%%" % e["value"]
+        print("%s 亮度 %s（%s）" % (name, val, e["mode_label"]))
+        if e.get("reason"):
+            print("原因: " + e["reason"])
+        if e.get("hint"):
+            print("需要权限:\n" + e["hint"])
+        return 0
+
+    if sub == "set":
+        if len(args) < 3:
+            raise core.DMError("用法: dm_cli.py brightness set <输出名> <0-100>")
+        r = core.set_brightness(args[1], args[2])
+        print(r["message"])
+        return 0
+
+    raise core.DMError("未知 brightness 子命令: %s（可用 list/get/set）" % sub)
 
 
 if __name__ == "__main__":

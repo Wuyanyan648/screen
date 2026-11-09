@@ -262,6 +262,89 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
   5. 刚启动界面时，某屏此后一直没变化，计时从启动那一刻算起（不是从「上次真实变化」算）。
   所以它是**近似信号**，界面文案也写成「似乎闲置 / 要不要关掉」，且必须人工确认才关。
 
+## 亮度调节（每块屏一条滑杆）
+
+界面右侧每块已连接屏的卡片里有一条亮度滑杆：拖动时只更新本地百分比，**最多每 130ms 提交一次**，
+松手立刻提交最终值，不会按像素发请求（`ddcutil` 单次 100~300ms，堆起来会卡）。
+
+### 三条通道与选择顺序
+
+| 通道 | 用于 | 判定方式 | 特点 |
+| --- | --- | --- | --- |
+| `硬件 DDC/CI` | 外接屏（DP-0 / HDMI-0） | 有 `ddcutil` + `/dev/i2c-*` 可读写 + EDID 能对上 DRM 连接器 | 改显示器背光，画质最好 |
+| `硬件背光` | 内屏（DP-4/eDP） | `/sys/class/backlight/*` 存在且 `brightness` 可写 | 改面板背光 |
+| `软件调光（影响对比度）` | 任意已启用输出 | `xrandr --output X --brightness 0.00~1.00` | 改显卡 gamma，亮度降时对比度也降 |
+| `不支持调节` | 屏已关闭 / 无任何通道 | — | 滑杆禁用，卡片里写原因与所需权限 |
+
+本机实测（2026-11-09）：
+
+- **DP-0（AOC U27G3X）**：`ddcutil` **未安装**，`/dev/i2c-*` 是 `0600 root`、系统里也没有 `i2c` 组，
+  所以现在走**软件调光**；装好 ddcutil + i2c 权限后会自动改用硬件 DDC，不用改代码。
+- **DP-4（eDP 内屏）**：`/sys/class/backlight/nvidia_0` 存在，但 `brightness` 是 `root:video 0660`，
+  当前用户不在 `video` 组 → 写不进去；X 上的 `Backlight` 属性是**只读**的
+  （`xrandr --output DP-4 --set Backlight 40` 返回 `BadValue`）。所以现在也走软件调光。
+- **HDMI-0（便携屏）**：DDC 未探测（缺 ddcutil）；开启后按软件调光处理。
+
+### 需要你自己执行的权限配置（按需，可都不做）
+
+外接屏走 DDC/CI（DP-0、HDMI-0）：
+
+```bash
+sudo apt install ddcutil
+echo 'SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/60-i2c-uaccess.rules
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=i2c-dev
+```
+
+`/dev/i2c-*` 本机已经存在；若 `ddcutil detect` 报打不开总线，先 `sudo modprobe i2c-dev`。
+不想用 udev 也可以建 `i2c` 组把用户加进去，但 `uaccess` 只在本地登录会话生效，范围更小。
+
+内屏走硬件背光（DP-4）：
+
+```bash
+sudo usermod -aG video "$USER"     # 重新登录后生效
+```
+
+没配权限时滑杆**不会失效**：外接屏和内屏都退到软件调光，卡片里写明
+「DDC 不可用：…」/「硬件背光 65%（只读，需 video 组权限）」。
+
+### 失败反馈
+
+- 设置失败时，滑杆下方红字给出原因，同时右下角 toast；例如屏已关闭：
+  `屏已关闭，gamma 调光无法生效`。
+- DDC 打不开总线时错误里直接带 udev 命令；背光写失败时带 `usermod -aG video`。
+- 单块屏探测失败不影响其它屏，也不影响布局图与开关功能。
+
+### 持久化与恢复
+
+- 位置：`~/.cache/display-manager.brightness.json`（每块屏最后一次的 `value` / `mode` / 时间）。
+- 服务启动 0.8 秒后由后台线程对**已启用**输出重新下发一次；屏是 `off` 时不应用。
+- 「关闭 → 开启」某块屏后，`on` 成功会立刻再应用一次上次的亮度（模式设置会复位 gamma）。
+- 通道从「软件调光」切到硬件时会把 gamma 复位为 1.0，避免双重压暗。
+
+### API / CLI（门户后续可直接复用）
+
+```bash
+curl -s http://127.0.0.1:8765/api/brightness          # 亮度总览
+curl -s -X POST -H 'Content-Type: application/json' \
+     -d '{"name":"DP-0","value":60}' http://127.0.0.1:8765/api/brightness
+
+python3 backend/dm_cli.py brightness                  # 每块屏的通道与当前值
+python3 backend/dm_cli.py brightness get  DP-0        # 走硬件通道时实时读
+python3 backend/dm_cli.py brightness set  DP-0 60     # 0~100
+```
+
+### 验证记录（本机，2026-11-09）
+
+- DP-0：`set 70` 后 `xrandr --verbose` 读到 `Brightness: 0.70`，`set 100` 回到 `1.0`。
+  截图（ffmpeg x11grab）看不出明暗变化是正常的：截图读 framebuffer，不经过显卡 gamma LUT，
+  视觉确认只能看物理屏。
+- DP-4：开启后同样实测 `1.0 → 0.60 → 1.0`；`off` 再 `on` 后 `Brightness` 自动回到 `0.60`
+  （日志：`已重新应用 DP-4 的亮度`）。测完已恢复到 100% 并重新关闭内屏，显示器状态与测试前一致。
+- HDMI-0 当前是关闭状态，通道判定为软件调光，未采集画面证据。
+- **未验证**：AOC 上 `setvcp 10` 的实际效果 —— 本机没有 ddcutil，我也没有 sudo 权限安装。
+  装好后用 `dm_cli.py brightness get DP-0` 会走 `getvcp 10`，即可核对读数与画面。
+
 ## 界面把自己的屏关掉了怎么救
 
 1. 最快：按全局快捷键 **`Ctrl+Alt+Shift+F12`**（恢复全部），不需要浏览器、不需要切终端。
@@ -427,6 +510,7 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
 | `~/.cache/display-manager.state` | 关闭前保存的四件套（模式/刷新率/transform/位置/primary） |
 | `~/.cache/display-manager.off` | 用户主动关闭的输出名单（供与看门狗共存、界面标注） |
 | `~/.cache/display-manager.log` | 操作日志（含 xrandr 原始 stderr、快捷键注册/触发） |
+| `~/.cache/display-manager.brightness.json` | 每块屏上次的亮度值与所用通道 |
 | `~/.config/display-manager/config.json` | 闲置阈值（默认 300 秒，0 = 关闭提醒） |
 | `~/.config/systemd/user/screen-manager.service` | 8765 的用户单元（`install-autostart.sh` 生成） |
 | `~/.config/systemd/user/screen-portal.service` | 8760 门户的用户单元 |
@@ -443,7 +527,9 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
 - Python 3.12（本机自带），**只用标准库**：`http.server` / `subprocess` / `ctypes`。
 - 系统库：`libX11.so.6`、`libXdamage.so.1`、`libXss.so.1`（本机已随 GNOME 安装，无需装包）。
 - 不用 sudo，不装 xscreensaver / xprintidle / xdotool / xbindkeys。
-  （例外：8787 的「随会话停止 + 免密启停」需要一次性 sudo drop-in/polkit，见上文，可选。）
+  （例外 1：8787 的「随会话停止 + 免密启停」需要一次性 sudo drop-in/polkit，见上文，可选。
+  例外 2：想要外接屏走硬件 DDC 需要 `ddcutil` + i2c udev 规则，想要内屏走硬件背光需要加入
+  `video` 组；两者都不装也能用，会自动降级到软件调光，见「亮度调节」一节。）
 
 ## 已知限制
 
@@ -451,6 +537,10 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
 - GNOME/mutter 在 RandR 变化后有时会重新套用自己的显示配置，若发现关掉后又被拉回，
   先看 `~/.cache/display-manager.log` 与 `~/.cache/hdmi-watchdog.log` 确认是谁动的手。
 - 闲置检测只覆盖「画面变化」，不区分「有变化但没人看」和「没人看但无变化」。
+- 软件调光是改显卡 gamma，亮度降低时**对比度也会降低**；外接屏拿到 DDC/i2c 权限、
+  内屏拿到 video 组权限后会自动改用硬件通道，画质更好。
+- 亮度值只记「本工具最后一次设置的值」；用显示器实体按键或没经过本工具改动过亮度时，
+  界面显示可能滞后，点「刷新」（`/api/brightness?refresh=1`）会重新读硬件值。
 - 未连接（disconnected）的输出不参与开关与统计。
 - 内屏（eDP）关闭后理论上存在个别 NVIDIA 机型唤不回来的风险；本机实测可正常恢复
   （见下一节），如果换机器出现唤不回，用 `Ctrl+Alt+Shift+F12` / `dm_cli.py restore-all` /
@@ -463,8 +553,9 @@ polkit 认证失败（`最近操作 … 失败`），注销时 8787 也不会自
 已验证（本机真机，2026-11-09）：
 
 - **界面入口与形态**：`GET /` 与 `/display-manager.html` 均 200，`/index.html` 返回 404
-  （旧的 `index.html` 已删除，只保留一份）；页面内 `<input>` / `<textarea>` 数量为 0，
-  只有 1 个 `<select>`（闲置阈值），全部操作都是点击。
+  （旧的 `index.html` 已删除，只保留一份）；页面里**没有文本输入框**（`<input type=text|number>`
+  与 `<textarea>` 均为 0），只有 1 个 `<select>`（闲置阈值）和每块屏 1 条
+  `<input type="range">` 亮度滑杆；所有操作都是点击或拖动滑杆。
 - **常驻与自愈**：`run-service.sh` 启动后，`kill -9` 掉 python，4 秒内出现新 pid，
   `/api/state` 立即恢复 200；重复启动第二个实例打印端口占用并以退出码 3 退出。
   现已迁移到 `screen-manager.service`：`systemctl --user stop` 后端口释放、unit inactive、

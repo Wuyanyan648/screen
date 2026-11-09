@@ -16,6 +16,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dm_core as core  # noqa: E402
+import dm_brightness  # noqa: E402
 import dm_hotkey  # noqa: E402
 import dm_idle  # noqa: E402
 
@@ -60,6 +61,13 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/log":
             self._json({"ok": True, "lines": core.read_log_tail(80)})
             return
+        if path == "/api/brightness":
+            refresh = "refresh=1" in self.path
+            try:
+                self._json({"ok": True, "brightness": core.brightness_state(refresh)})
+            except core.DMError as e:
+                self._json({"ok": False, "error": str(e)}, 500)
+            return
         if path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
@@ -99,6 +107,14 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json({"ok": True, "plan": core.plan_off(name)})
                 elif path == "/api/config":
                     self._json({"ok": True, "config": core.save_config(body)})
+                elif path == "/api/brightness":
+                    if not name:
+                        self._json({"ok": False, "error": "缺少输出名"}, 400)
+                        return
+                    if "value" not in body:
+                        self._json({"ok": False, "error": "缺少亮度值"}, 400)
+                        return
+                    self._json(core.set_brightness(name, body["value"]))
                 else:
                     self._json({"ok": False, "error": "未知接口"}, 404)
         except core.DMError as e:
@@ -131,6 +147,18 @@ def serve(argv: list[str]) -> int:
 
     url = "http://127.0.0.1:%d/" % port
     core.log("启动网页界面 %s（pid=%d）" % (url, os.getpid()))
+
+    # 亮度持久化：服务起来后把上次的值重新下发（关屏时不会应用，等开启时再补）
+    def _restore_brightness():
+        time.sleep(0.8)
+        try:
+            msgs = dm_brightness.apply_all()
+            if msgs:
+                print("启动恢复亮度: " + "，".join(msgs))
+        except Exception as e:
+            core.log("启动恢复亮度异常: %r" % e)
+
+    threading.Thread(target=_restore_brightness, daemon=True).start()
 
     # 闲置检测：XDamage 逐屏计时，失败则降级为 XScreenSaver 全局空闲
     monitor = dm_idle.DamageMonitor(

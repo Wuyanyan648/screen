@@ -187,21 +187,38 @@ def _parse_query(text: str) -> dict:
 
 
 def _parse_details(text: str) -> dict:
-    """解析 `xrandr --current --verbose`：Transform 矩阵与 ConnectorType。"""
+    """解析 `xrandr --current --verbose`：Transform、ConnectorType、Brightness、EDID。"""
     details: dict[str, dict] = {}
     name = None
-    for i, line in enumerate(text.splitlines()):
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
         if line and not line[0].isspace():
             mm = HEADER_RE.match(line)
             name = mm.group("name") if mm else None
             if name:
-                details.setdefault(name, {"transform": None, "connector_type": None})
+                details.setdefault(name, {"transform": None, "connector_type": None,
+                                          "brightness": None, "edid": None})
             continue
         if not name:
             continue
         s = line.strip()
         if s.startswith("ConnectorType:"):
             details[name]["connector_type"] = s.split(":", 1)[1].strip()
+        elif s.startswith("Brightness:"):
+            try:
+                details[name]["brightness"] = float(s.split(":", 1)[1])
+            except ValueError:
+                pass
+        elif s.startswith("EDID:"):
+            buf = []
+            for chunk in lines[i + 1:]:
+                t = chunk.strip()
+                if re.fullmatch(r"[0-9a-fA-F]{32}", t):
+                    buf.append(t)
+                else:
+                    break
+            if buf:
+                details[name]["edid"] = bytes.fromhex("".join(buf))
         elif s.startswith("Transform:"):
             nums: list[float] = []
             for chunk in text.splitlines()[i:i + 4]:
@@ -355,10 +372,17 @@ def snapshot() -> dict:
     enabled = [o for o in outputs if o["enabled"]]
     canvas = _bbox(enabled)
     idle_info = _attach_idle(outputs, time.time())
+    try:
+        import dm_brightness
+        bright = dm_brightness.summary(outputs, details)
+    except Exception as e:  # 亮度探测失败不影响布局功能
+        bright = {}
+        log("亮度状态探测失败: %r" % e)
     return {
         "ok": True,
         "server_screen": q["screen"],
         "outputs": outputs,
+        "brightness": bright,
         "enabled_count": len(enabled),
         "canvas": canvas,
         "off_marked": marked,
@@ -513,6 +537,13 @@ def turn_off(name: str, reason: str = "cli") -> dict:
     log("已关闭 %s；剩余启用: %s；画布 %sx%d" % (
         name, ", ".join(x["name"] for x in after["outputs"] if x["enabled"]) or "无",
         after["canvas"]["w"], after["canvas"]["h"]))
+    # RandR 重新配置会把所有输出的 gamma 复位，把还在用软件调光的屏补回来
+    try:
+        import dm_brightness
+        dm_brightness.reapply_software()
+        dm_brightness.schedule_software_reapply()   # mutter 可能稍后再复位一次
+    except Exception as e:
+        log("关闭 %s 后恢复其它屏软件调光失败: %r" % (name, e))
     return {"ok": True, "action": "off", "name": name, "plan": plan, "state": after,
             "message": "已关闭 %s，剩余 %d 块屏" % (name, plan["remaining_count"])}
 
@@ -576,9 +607,55 @@ def turn_on(name: str, reason: str = "cli") -> dict:
         log("警告: 布局存在重叠 " + json.dumps(ov, ensure_ascii=False))
 
     log("已启用 %s: %s@%s 几何 %s" % (name, got["mode"], got["rate"], actual))
+    # 重新打开后 gamma 会被模式设置复位，把上次的亮度再下发一次
+    try:
+        import dm_brightness
+        if dm_brightness.reapply_for(got):
+            log("已重新应用 %s 的亮度" % name)
+        dm_brightness.reapply_software()   # 开启动作同样会让其它屏的 gamma 复位
+        dm_brightness.schedule_software_reapply()
+    except Exception as e:
+        log("重新应用 %s 亮度失败: %r" % (name, e))
     return {"ok": True, "action": "on", "name": name, "state": after,
             "restored_from": src, "geometry": actual, "warning": warn,
             "message": "已启用 %s（%s）" % (name, src)}
+
+
+def set_brightness(name: str, value) -> dict:
+    """设置亮度（0~100）。通道选择见 dm_brightness.py：硬件背光/DDC 优先，其次软件调光。"""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise DMError("亮度必须是 0~100 的整数")
+    if not 0 <= v <= 100:
+        raise DMError("亮度必须在 0~100 之间")
+
+    snap = snapshot()
+    o = _find(snap, name)
+    if not o["connected"]:
+        raise DMError("%s 当前不是 connected（%s）" % (name, o["status"]))
+
+    import dm_brightness
+    try:
+        entry = dm_brightness.set_value(o, v)
+    except dm_brightness.BrightError as e:
+        raise DMError(str(e))
+    return {"ok": True, "name": name, "brightness": entry,
+            "message": "%s 亮度已设为 %s%%（%s）" % (
+                name, entry["value"], entry["mode_label"])}
+
+
+def brightness_state(refresh: bool = False) -> dict:
+    """亮度总览；refresh=True 时强制重读硬件值（ddcutil getvcp / sysfs / gamma）。"""
+    snap = snapshot()
+    if not refresh:
+        return snap.get("brightness") or {}
+    details = {}
+    rc, out, _ = xrandr([], verbose=True)
+    if rc == 0:
+        details = _parse_details(out)
+    import dm_brightness
+    return dm_brightness.summary(snap["outputs"], details, refresh=True)
 
 
 def restore_all(reason: str = "cli") -> dict:

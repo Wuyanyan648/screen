@@ -85,6 +85,29 @@
   .cardActions{display:flex;gap:8px;margin-top:9px}
   .cardActions button{flex:1;padding:5px 8px}
   .help{font-size:11.5px;color:var(--dim);line-height:1.65}
+  /* 亮度滑杆 */
+  .bright{margin-top:9px;border-top:1px dashed var(--line);padding-top:8px}
+  .brightHead{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);flex-wrap:wrap}
+  .brightHead b{margin-left:auto;color:var(--text);font-size:12.5px;font-variant-numeric:tabular-nums}
+  .btag{font-size:10.5px;padding:1px 6px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .btag.hw{color:#7ee787;border-color:#2ea043;background:#12281a}
+  .btag.sw{color:#ffd28a;border-color:#9e6a03;background:#2b2007}
+  .btag.no{color:#ff9c96;border-color:#8b2c2c;background:#2a1414}
+  .slider{-webkit-appearance:none;appearance:none;width:100%;height:16px;margin:5px 0 0;
+    background:transparent;cursor:pointer;display:block}
+  .slider::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:#2b333d}
+  .slider::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;margin-top:-5px;
+    border-radius:50%;background:#58a6ff;border:2px solid #0d1117}
+  .slider::-moz-range-track{height:4px;border-radius:2px;background:#2b333d}
+  .slider::-moz-range-progress{height:4px;border-radius:2px;background:#1f6feb}
+  .slider::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:#58a6ff;
+    border:2px solid #0d1117}
+  .slider:disabled{opacity:.45;cursor:not-allowed}
+  .bnote{font-size:11px;color:var(--dim);line-height:1.55;margin-top:5px}
+  .bhint{font-size:11px;color:#ffd28a;margin-top:5px}
+  .bhint summary{cursor:pointer;outline:none}
+  .bhint summary:hover{text-decoration:underline}
+  .berr{font-size:11px;color:#ffb3ad;line-height:1.55;margin-top:5px;white-space:pre-wrap;word-break:break-word}
   .asideFoot{padding:10px 12px;border-top:1px solid var(--line)}
   .asideFoot summary{cursor:pointer;color:var(--dim);font-size:12px;outline:none}
   .asideFoot .help{margin-top:8px}
@@ -227,6 +250,11 @@ let connected = null;        // null=未知 true=已连接 false=断开
 let autoRestoreWanted = true;
 let autoTimer = null;
 let lastSig = null;          // 结构签名：没变化就不重建 DOM，避免每 2 秒重绘导致按钮点不中
+let brightTimer = {};        // 每块屏的节流定时器
+let brightDraft = {};        // 拖动中的本地值
+let brightSeq = {};          // 每个输出最近一次请求序号，防止旧响应覆盖新值
+let brightErr = {};          // 最近一次失败的提示
+let brightDragging = null;   // 正在拖动的输出名（拖动时不做重建/回写）
 
 /* ---------------- 数据 ---------------- */
 async function fetchState(){
@@ -271,6 +299,13 @@ function setConn(ok){
 async function refresh(manual){
   try{
     state = await fetchState();
+    if(manual){
+      // 手动刷新时顺便重读亮度硬件值（DDC 的 getvcp / sysfs / gamma）
+      try{
+        const b = await (await fetch('/api/brightness?refresh=1')).json();
+        if(b && b.ok && state.brightness) Object.assign(state.brightness, b.brightness);
+      }catch(e){ /* 亮度刷新失败不影响布局状态 */ }
+    }
     if(selected && !state.outputs.some(o=>o.name===selected)) selected = null;
     setConn(true);
     render();
@@ -477,6 +512,9 @@ function renderCards(){
     kv.innerHTML = rows.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join('');
     card.appendChild(kv);
 
+    const bwrap = buildBright(o);
+    if(bwrap) card.appendChild(bwrap);
+
     if(o.enabled && o.idle){
       const hint = document.createElement('div');
       hint.className = 'help';
@@ -539,13 +577,19 @@ function structuralSig(s){
       o.x, o.y, o.w, o.h, o.mode, o.rate, o.scale,
       o.transform ? o.transform[0] : null,
       o.idle ? Math.floor((o.idle_seconds||0)/60) : null
-    ])
+    ]),
+    // 亮度只放「能力」相关字段；具体数值不进签名，拖动时不重建 DOM
+    b: s.brightness ? Object.keys(s.brightness).sort().map(k=>{
+      const b = s.brightness[k];
+      return [k, b.mode, b.available, b.mode_label, b.note, b.reason];
+    }) : []
   });
 }
 
 function render(force){
   if(!state) return;
   $('#stamp').textContent = state.time;
+  syncBrightSliders();
   const sig = structuralSig(state);
   if(!force && sig === lastSig) return;
   lastSig = sig;
@@ -556,6 +600,141 @@ function render(force){
   renderCanvas();
   renderTray();
   renderCards();
+}
+
+/* ---------------- 亮度滑杆 ---------------- */
+const BRIGHT_THROTTLE_MS = 130;   // 拖动时最多每 130ms 提交一次，避免 ddcutil 调用堆积
+
+function buildBright(o){
+  const b = state.brightness && state.brightness[o.name];
+  if(!b) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'bright';
+  wrap.dataset.out = o.name;
+
+  const head = document.createElement('div');
+  head.className = 'brightHead';
+  const tagCls = b.mode === 'none' ? 'no' : (b.hardware ? 'hw' : 'sw');
+  head.innerHTML = `<span>亮度</span><b>${b.value === null ? '-' : b.value + '%'}</b>`
+                 + `<span class="btag ${tagCls}">${b.mode_label}</span>`;
+  wrap.appendChild(head);
+
+  const sl = document.createElement('input');
+  sl.type = 'range'; sl.className = 'slider';
+  sl.min = 0; sl.max = 100; sl.step = 1;
+  sl.value = b.value === null ? 100 : b.value;
+  sl.disabled = !b.available;
+  sl.title = b.available ? '拖动调节亮度（松手后立即生效）'
+                         : (b.reason || '这块屏不支持亮度调节');
+  sl.oninput = () => {
+    brightDragging = o.name;
+    brightDraft[o.name] = Number(sl.value);
+    head.querySelector('b').textContent = sl.value + '%';
+    queueBright(o.name, Number(sl.value));
+  };
+  sl.onchange = () => {
+    brightDragging = null;
+    sendBright(o.name, Number(sl.value));
+  };
+  sl.onclick = ev => ev.stopPropagation();
+  wrap.appendChild(sl);
+
+  if(b.note){
+    const n = document.createElement('div');
+    n.className = 'bnote';
+    n.textContent = b.note;
+    wrap.appendChild(n);
+  }
+  if(b.reason){
+    const r = document.createElement('div');
+    r.className = 'berr berr-static';
+    r.textContent = b.reason;
+    wrap.appendChild(r);
+  }
+  if(b.hint && !b.available){
+    const h = document.createElement('div');
+    h.className = 'bnote';
+    h.style.color = '#ffd28a';
+    h.textContent = '需要权限：' + b.hint;
+    wrap.appendChild(h);
+  }
+  if(b.hint && b.available){
+    const d = document.createElement('details');
+    d.className = 'bhint';
+    const s = document.createElement('summary');
+    s.textContent = '如何启用硬件通道';
+    const pre = document.createElement('div');
+    pre.className = 'bnote';
+    pre.style.whiteSpace = 'pre-wrap';
+    pre.textContent = b.hint;
+    d.appendChild(s);
+    d.appendChild(pre);
+    wrap.appendChild(d);
+  }
+  if(brightErr[o.name]){
+    const e = document.createElement('div');
+    e.className = 'berr berr-js';
+    e.textContent = brightErr[o.name];
+    wrap.appendChild(e);
+  }
+  // 卡片本身有点击选中行为，滑杆区域不要触发
+  wrap.onclick = ev => ev.stopPropagation();
+  return wrap;
+}
+
+function queueBright(name, value){
+  brightDraft[name] = value;
+  if(brightTimer[name]) return;          // 上一拍还没到，等它统一提交最新值
+  brightTimer[name] = setTimeout(() => {
+    brightTimer[name] = null;
+    sendBright(name, brightDraft[name]);
+  }, BRIGHT_THROTTLE_MS);
+}
+
+async function sendBright(name, value){
+  const seq = (brightSeq[name] = (brightSeq[name] || 0) + 1);
+  try{
+    const r = await post('/api/brightness', {name, value});
+    if(seq !== brightSeq[name]) return;          // 已有更新的请求，丢弃旧结果
+    if(!r.ok) throw new Error(r.error || '设置失败');
+    if(state && state.brightness && r.brightness) state.brightness[name] = r.brightness;
+    delete brightErr[name];
+  }catch(e){
+    if(seq !== brightSeq[name]) return;
+    brightErr[name] = e.message;
+    toast(`亮度设置失败：${e.message}`, true);
+  }
+  updateBrightText(name);
+}
+
+function updateBrightText(name){
+  const wrap = document.querySelector(`.bright[data-out="${name}"]`);
+  if(!wrap) return;
+  const b = state && state.brightness && state.brightness[name];
+  const val = wrap.querySelector('b');
+  if(val && b) val.textContent = b.value === null ? '-' : b.value + '%';
+  wrap.querySelectorAll('.berr-js').forEach(el => el.remove());
+  if(brightErr[name]){
+    const e = document.createElement('div');
+    e.className = 'berr berr-js';
+    e.textContent = brightErr[name];
+    wrap.appendChild(e);
+  }
+}
+
+// 轮询回来的值回写到滑杆；拖动中不回写，避免手柄跳
+function syncBrightSliders(){
+  if(!state || !state.brightness) return;
+  document.querySelectorAll('.bright').forEach(wrap => {
+    const name = wrap.dataset.out;
+    if(brightDragging === name) return;
+    const b = state.brightness[name];
+    if(!b) return;
+    const sl = wrap.querySelector('input[type=range]');
+    if(sl && !sl.disabled && b.value !== null) sl.value = b.value;
+    const val = wrap.querySelector('b');
+    if(val) val.textContent = b.value === null ? '-' : b.value + '%';
+  });
 }
 
 /* ---------------- 操作 ---------------- */
