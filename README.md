@@ -276,16 +276,21 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 | `软件调光（影响对比度）` | 任意已启用输出 | `xrandr --output X --brightness 0.00~1.00` | 改显卡 gamma，亮度降时对比度也降 |
 | `不支持调节` | 屏已关闭 / 无任何通道 | — | 滑杆禁用，卡片里写原因与所需权限 |
 
-本机实测（2026-11-09）：
+本机实测（2026-11-09，已装 `ddcutil 1.4.1` + `i2c-tools`，已配 udev `uaccess`、已把用户加入 `video` 组）：
 
-- **DP-0（AOC U27G3X）**：`ddcutil` **未安装**，`/dev/i2c-*` 是 `0600 root`、系统里也没有 `i2c` 组，
-  所以现在走**软件调光**；装好 ddcutil + i2c 权限后会自动改用硬件 DDC，不用改代码。
-- **DP-4（eDP 内屏）**：`/sys/class/backlight/nvidia_0` 存在，但 `brightness` 是 `root:video 0660`，
-  当前用户不在 `video` 组 → 写不进去；X 上的 `Backlight` 属性是**只读**的
-  （`xrandr --output DP-4 --set Backlight 40` 返回 `BadValue`）。所以现在也走软件调光。
-- **HDMI-0（便携屏）**：DDC 未探测（缺 ddcutil）；开启后按软件调光处理。
+- **DP-0（AOC U27G3X）**：走**硬件 DDC/CI**（`ddcutil detect` 报 `card1-DP-1` / `/dev/i2c-3`，
+  `getvcp 10` 读到 `0/100`，`setvcp 10 30` 后读回 30，实际可写）。
+  注意该屏 VCP 10 当前读到 **0** 而画面正常，疑似显示器在 HDR/预设模式下锁定了亮度回报；
+  写 30 再恢复 0 后读数正常，实际观感以下发为准。
+- **HDMI-0（便携屏 Sculptor）**：`ddcutil detect` 把它列为 `Invalid display`
+  （`card1-HDMI-A-1` / `/dev/i2c-5`，DDC 通信失败），**只能软件调光**；卡片会写
+  「HDMI-0 不响应 DDC/CI（Sculptor），只能软件调光」。
+- **DP-4（eDP 内屏）**：`/sys/class/backlight/nvidia_0/brightness` 是 `root:video 0660`。
+  用户已加入 `video` 组，但**组成员资格要重新登录才生效**；在重新登录前仍显示软件调光，
+  卡片提示会变成「已加入 video 组，注销重新登录后自动生效（本会话仍是软件调光）」。
+  另外 nvidia 驱动对「写入相同值」返回 `EINVAL`，代码会先比对再写，不当作失败。
 
-### 需要你自己执行的权限配置（按需，可都不做）
+### 需要你自己执行的权限配置（本机已做完，留作换机参考）
 
 外接屏走 DDC/CI（DP-0、HDMI-0）：
 
@@ -307,6 +312,13 @@ sudo usermod -aG video "$USER"     # 重新登录后生效
 
 没配权限时滑杆**不会失效**：外接屏和内屏都退到软件调光，卡片里写明
 「DDC 不可用：…」/「硬件背光 65%（只读，需 video 组权限）」。
+
+### 通道切换时不沿用旧百分比
+
+记录里保存了上次的 `mode`。如果探测结果显示通道变了（例如刚装好 ddcutil，从「软件调光 100%」
+变成「硬件 DDC/CI」），启动时**不下发旧百分比**，而是采纳硬件当前值并落盘，日志写
+`DP-0 亮度通道 software→ddc，采用硬件当前值 0%（不下发旧值）`。
+否则会把 100 硬写进刚拿到的硬件通道，屏幕突然跳到最亮。代价是软件调光时期的百分比不会迁移过去。
 
 ### 失败反馈
 
@@ -342,8 +354,19 @@ python3 backend/dm_cli.py brightness set  DP-0 60     # 0~100
 - DP-4：开启后同样实测 `1.0 → 0.60 → 1.0`；`off` 再 `on` 后 `Brightness` 自动回到 `0.60`
   （日志：`已重新应用 DP-4 的亮度`）。测完已恢复到 100% 并重新关闭内屏，显示器状态与测试前一致。
 - HDMI-0 当前是关闭状态，通道判定为软件调光，未采集画面证据。
-- **未验证**：AOC 上 `setvcp 10` 的实际效果 —— 本机没有 ddcutil，我也没有 sudo 权限安装。
-  装好后用 `dm_cli.py brightness get DP-0` 会走 `getvcp 10`，即可核对读数与画面。
+- **AOC DDC 实测（2026-11-09，装好 ddcutil + uaccess 后）**：
+  `ddcutil --bus 3 getvcp 10` → `0/100`；`setvcp 10 30` → 读回 30；`setvcp 10 0` 恢复；
+  `ddcutil detect` 把 AOC 识别为 `card1-DP-1 /dev/i2c-3 Model: U27G3X`，
+  便携屏列为 `Invalid display`（`card1-HDMI-A-1 /dev/i2c-5 Sculptor`）。
+- **通道判定回归**：`dm_cli.py brightness` 显示 `DP-0 0% 硬件 DDC/CI /dev/i2c-3`；
+  `/api/state` 的 `brightness.DP-0` 为 `mode=ddc, hardware=true, device=/dev/i2c-3`；
+  无头浏览器 DOM 里卡片的标签是 `<span class="btag hw">硬件 DDC/CI</span>`。
+- **内屏背光函数级验证**（内屏当时是关闭的，无视觉影响）：`sg video` 下
+  `_backlight_set` 同值写返回成功（不再报 EINVAL），写 66 读回 66，再恢复 65 读回 65；
+  `_pick_mode(DP-4)` 在 `sg video` 下返回 `backlight`（65%），普通进程返回 `software` 并提示重新登录。
+- **本次修掉的解析缺陷**：`ddcutil detect` 的 `Invalid display` 段会重复打印
+  `I2C bus / DRM connector / Model`，旧解析会把 AOC 的总线覆盖成便携屏的 `/dev/i2c-5`
+  （结果：AOC 丢失、便携屏被误标成「硬件 DDC/CI」）。已按段切分修正。
 
 ## 界面把自己的屏关掉了怎么救
 

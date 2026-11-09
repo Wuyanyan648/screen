@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """亮度调节：能力探测（DDC/CI、sysfs 背光、软件 gamma）、读写与持久化。
 
-本机实测结论（2026-11-09）：
-- DP-4（eDP 内屏）：`/sys/class/backlight/nvidia_0` 存在但 brightness 是 root:video 0660，
-  当前用户不在 video 组，直接写会 PermissionError；X 上的 `Backlight` 属性只读
-  （`xrandr --set Backlight` 返回 BadValue）。因此默认走软件调光，拿到权限后自动切硬件背光。
-- DP-0（AOC U27G3X，DisplayPort）：DDC/CI 需要 ddcutil + /dev/i2c-* 权限；本机未安装
-  ddcutil 且 i2c 设备是 0600 root，暂时只能软件调光，装好权限后自动改用 setvcp 10。
-- HDMI-0（便携屏）：同样走 DDC 探测；探测不到就软件调光（gamma）。
+本机实测结论（2026-11-09，已装 ddcutil 1.4.1 + i2c-tools）：
+- DP-0（AOC U27G3X，DisplayPort，ddcutil 报 card1-DP-1 / /dev/i2c-3）：DDC/CI 可读可写，
+  `getvcp 10` 返回 0/100（0 疑似显示器 HDR/预设锁定，写 30 后读回 30 正常），走硬件 DDC。
+- HDMI-0（便携屏 Sculptor）：ddcutil 列为 "Invalid display"，DDC 通信失败，只能软件调光。
+- DP-4（eDP 内屏）：无 DDC；`/sys/class/backlight/nvidia_0/brightness` 是 root:video 0660。
+  用户已加入 video 组并通过 udev `uaccess` 拿到 `/dev/i2c-*`，但**背光权限要重新登录**才生效；
+  注意 nvidia 驱动对「写入相同值」返回 EINVAL，写前先比对（见 `_backlight_set`）。
+- `/dev/i2c-*` 由 `/etc/udev/rules.d/60-i2c-uaccess.rules` 的 `TAG+="uaccess"` 授权，无需 sudo。
 
 三条通道的优先级：硬件背光（内屏）/ DDC（外接）→ 软件 gamma → 不支持。
 「软件调光」改的是显卡 gamma，亮度下降时对比度也会变，界面必须单独标注。
@@ -36,7 +37,7 @@ CONFIG_FILE = os.path.join(
 BACKLIGHT_DIR = "/sys/class/backlight"
 DRM_DIR = "/sys/class/drm"
 
-DDC_TTL = 60          # ddcutil detect 结果缓存秒数（detect 本身要 1~2 秒）
+DDC_TTL = 300         # ddcutil detect 结果缓存秒数（detect 约 0.6 秒，别每次都跑）
 VALUE_TTL = 300       # 硬件读值缓存秒数，避免每 2 秒轮询都去读 DDC
 
 I2C_HINT = (
@@ -46,6 +47,21 @@ I2C_HINT = (
     "sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=i2c-dev"
 )
 VIDEO_HINT = "sudo usermod -aG video $USER（重新登录后生效；之后自动改用硬件背光）"
+
+
+def video_hint() -> str:
+    """已经把用户加进 video 组时，提示改成「重新登录即可」，别让人重复执行。"""
+    try:
+        import grp
+        g = grp.getgrnam("video")
+        user = os.environ.get("USER") or ""
+        groups = os.getgroups()
+        if g.gr_gid in groups or (user and user in g.gr_mem):
+            return "已加入 video 组，注销重新登录后自动生效（本会话仍是软件调光）"
+    except (KeyError, OSError):
+        pass
+    return VIDEO_HINT
+
 
 _DDC = {"info": None, "ts": 0.0}
 _DDC_LOCK = threading.Lock()
@@ -141,6 +157,9 @@ def backlight_info() -> dict | None:
 
 def _backlight_set(info: dict, pct: int) -> int:
     raw = int(round(info["max"] * pct / 100.0))
+    if info.get("cur") == raw:
+        # nvidia 驱动对「写入相同值」返回 EINVAL，先比对再写，避免误报失败
+        return pct
     try:
         with open(info["path"], "w") as f:
             f.write(str(raw))
@@ -148,21 +167,39 @@ def _backlight_set(info: dict, pct: int) -> int:
         raise BrightError("没有写 %s 的权限（需要 video 组或 udev 规则）：%s"
                           % (info["path"], VIDEO_HINT))
     except OSError as e:
-        raise BrightError("写 %s 失败：%s" % (info["path"], e))
+        # 个别驱动接受写入后会在 close/flush 上报 EIO/EINVAL，值已生效就按成功处理
+        try:
+            with open(info["path"]) as f:
+                now = int(f.read().strip())
+        except (OSError, ValueError):
+            now = None
+        if now != raw:
+            raise BrightError("写 %s 失败：%s" % (info["path"], e))
     return pct
 
 
 # --------------------------------------------------------------------------- #
 # DDC/CI（ddcutil）
 # --------------------------------------------------------------------------- #
-def _parse_detect(text: str) -> list[dict]:
-    res: list[dict] = []
+def _parse_detect(text: str) -> tuple[list[dict], list[dict]]:
+    """解析 `ddcutil detect`，返回 (可用显示器, 无效显示器)。
+
+    注意 "Invalid display" 段同样会打印 I2C bus / DRM connector / Model，
+    必须在这里结束上一段，否则会把有效屏的总线覆盖成无效屏的（本机实测踩过：
+    AOC 被便携屏的 /dev/i2c-5 顶掉，界面还把便携屏误标成「硬件 DDC」）。
+    """
+    valid: list[dict] = []
+    invalid: list[dict] = []
     cur = None
     for line in text.splitlines():
         m = re.match(r"^Display (\d+)\s*$", line)
         if m:
             cur = {"num": int(m.group(1)), "bus": None, "connector": None, "model": None}
-            res.append(cur)
+            valid.append(cur)
+            continue
+        if line.startswith("Invalid display"):
+            cur = {"num": None, "bus": None, "connector": None, "model": None}
+            invalid.append(cur)
             continue
         if cur is None:
             continue
@@ -173,7 +210,7 @@ def _parse_detect(text: str) -> list[dict]:
             cur["connector"] = s.split(":", 1)[1].strip()
         elif s.startswith("Model:"):
             cur["model"] = s.split(":", 1)[1].strip()
-    return res
+    return valid, invalid
 
 
 def _ddc_state() -> dict:
@@ -181,7 +218,7 @@ def _ddc_state() -> dict:
     with _DDC_LOCK:
         if _DDC["info"] is not None and now - _DDC["ts"] < DDC_TTL:
             return _DDC["info"]
-        info = {"ok": False, "reason": "", "hint": "", "displays": []}
+        info = {"ok": False, "reason": "", "hint": "", "displays": [], "invalid": []}
         exe = shutil.which("ddcutil")
         if not exe:
             info["reason"] = "未安装 ddcutil（本机当前没有 DDC/CI 工具）"
@@ -198,8 +235,10 @@ def _ddc_state() -> dict:
                     info["reason"] = "ddcutil detect 失败：%s" % (
                         text.splitlines()[-1] if text else "无输出")
             else:
-                info["displays"] = _parse_detect(out)
-                if info["displays"]:
+                valid, invalid = _parse_detect(out)
+                info["displays"] = valid
+                info["invalid"] = invalid
+                if valid:
                     info["ok"] = True
                 else:
                     info["reason"] = "ddcutil 没发现支持 DDC/CI 的显示器"
@@ -275,8 +314,14 @@ def _ddc_error(text: str) -> BrightError:
     return BrightError("ddcutil 失败：%s" % (last[-1] if last else "无输出"))
 
 
+def _bus_num(bus: str) -> str:
+    """ddcutil 的 --bus 只收数字，detect 打印的是 /dev/i2c-3 这样的路径。"""
+    m = re.search(r"i2c-(\d+)", bus or "")
+    return m.group(1) if m else str(bus or "")
+
+
 def _ddc_get(bus: str) -> tuple[int, int]:
-    rc, out, err = _run(["ddcutil", "--bus", bus, "--sleep-multiplier", "0.3",
+    rc, out, err = _run(["ddcutil", "--bus", _bus_num(bus), "--sleep-multiplier", "0.3",
                          "getvcp", "10", "--brief"], 8)
     if rc != 0:
         raise _ddc_error(err or out)
@@ -287,7 +332,7 @@ def _ddc_get(bus: str) -> tuple[int, int]:
 
 
 def _ddc_set(bus: str, pct: int) -> None:
-    rc, out, err = _run(["ddcutil", "--bus", bus, "--sleep-multiplier", "0.3",
+    rc, out, err = _run(["ddcutil", "--bus", _bus_num(bus), "--sleep-multiplier", "0.3",
                          "setvcp", "10", str(pct)], 12)
     if rc != 0:
         raise _ddc_error(err or out)
@@ -336,9 +381,14 @@ def _pick_mode(o: dict) -> tuple[str, dict, str | None, str | None, str | None]:
         if panel and bl:
             cur = bl["actual"] if bl["actual"] is not None else bl["cur"]
             note = "硬件背光 %d%%（只读，需 video 组权限）" % round((cur or 0) * 100.0 / bl["max"])
-            hint = VIDEO_HINT
+            hint = video_hint()
         elif not panel:
-            if ddc["ok"]:
+            bad = _map_displays([o], {name: details.get("edid")},
+                                ddc.get("invalid") or []).get(name)
+            if bad:
+                note = "%s 不响应 DDC/CI（%s），只能软件调光" % (
+                    name, bad.get("model") or "未知型号")
+            elif ddc["ok"]:
                 note = "DDC/CI 没匹配到这台显示器，暂用软件调光"
             else:
                 note = "DDC 不可用：%s，暂用软件调光" % ddc["reason"]
@@ -348,7 +398,7 @@ def _pick_mode(o: dict) -> tuple[str, dict, str | None, str | None, str | None]:
     # 屏已关闭：没有可用通道
     reason = "屏已关闭，gamma 调光无法生效"
     if panel and bl and not bl["writable"]:
-        hint = VIDEO_HINT
+        hint = video_hint()
     elif not panel:
         hint = (ddc.get("hint") or "") if not ddc["ok"] else None
     else:
@@ -372,7 +422,7 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
     value = None
 
     if mode == "ddc":
-        if stored and not refresh:
+        if stored and not refresh and stored.get("mode") == "ddc":
             value = stored.get("value")
         else:
             cached = _VALUES.get(name)
@@ -389,7 +439,7 @@ def _entry(o: dict, details: dict, refresh: bool) -> dict:
         cur = bl["actual"] if bl["actual"] is not None else bl["cur"]
         value = None if cur is None else int(round(cur * 100.0 / bl["max"]))
     elif mode == "software":
-        if stored and not refresh:
+        if stored and not refresh and stored.get("mode") == "software":
             value = stored.get("value")
         else:
             g = (details.get(name) or {}).get("brightness")
@@ -451,6 +501,28 @@ def _details() -> dict:
         return {}
 
 
+def _mode_changed(o: dict, details: dict) -> dict | None:
+    """记录的通道与当前探测结果不一致时，以硬件当前值为准并更新记录。
+
+    典型场景：刚装好 ddcutil / 刚拿到 video 组权限，上次记录还是「软件调光 100%」。
+    如果照旧下发，会把 100 硬写进硬件通道，屏幕突然跳到最亮。这里改成采纳硬件
+    当前值（并落盘），返回变化摘要；没变化返回 None。
+    """
+    st = _stored().get(o["name"]) or {}
+    if not st:
+        return None
+    # refresh=True 才会真的去读硬件；否则 _entry 会直接回放记录里的旧值
+    entry = _entry(o, details, refresh=True)
+    if entry["mode"] == "none" or st.get("mode") == entry["mode"]:
+        return None
+    value = entry.get("value")
+    stored_value = 100 if value is None else int(value)
+    _store(o["name"], stored_value, entry["mode"])
+    _log("%s 亮度通道 %s→%s，采用硬件当前值 %d%%（不下发旧值）"
+         % (o["name"], st.get("mode"), entry["mode"], stored_value))
+    return {"mode": entry["mode"], "value": stored_value, "prev": st.get("mode")}
+
+
 def set_value(o: dict, pct: int, details: dict | None = None) -> dict:
     if not isinstance(pct, int) or not (0 <= pct <= 100):
         raise BrightError("亮度必须是 0~100 的整数")
@@ -490,8 +562,11 @@ def reapply_for(o: dict) -> dict | None:
     st = _stored().get(o["name"])
     if not st or not o.get("enabled"):
         return None
+    details = _details()
+    if _mode_changed(o, details):
+        return None
     try:
-        return set_value(o, int(st.get("value", 100)), _details())
+        return set_value(o, int(st.get("value", 100)), details)
     except BrightError as e:
         _log("重新应用 %s 亮度失败：%s" % (o["name"], e))
         return None
@@ -550,6 +625,10 @@ def apply_all() -> list[str]:
             continue
         st = _stored().get(o["name"])
         if not st:
+            continue
+        changed = _mode_changed(dict(o, _details=details.get(o["name"]) or {}), details)
+        if changed:
+            msgs.append("%s 通道→%s，用当前值 %d%%" % (o["name"], changed["mode"], changed["value"]))
             continue
         try:
             r = set_value(dict(o, _details=details.get(o["name"]) or {}),
