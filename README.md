@@ -33,7 +33,7 @@
 ## 快速开始
 
 ```bash
-cd ~/eric/wuyan_github/screen
+cd ~/eric/wuyan_github/local_service/screen
 
 ./install-autostart.sh     # 安装 systemd 用户单元 + 登录自启（无需 sudo）
 ./run-service.sh           # 或前台常驻运行（旧方式，崩溃自动重启）
@@ -351,9 +351,9 @@ python3 backend/dm_cli.py brightness set  DP-0 60     # 0~100
 2. 任意终端里：
 
    ```bash
-   python3 ~/eric/wuyan_github/screen/backend/dm_cli.py on DP-4
+   python3 ~/eric/wuyan_github/local_service/screen/backend/dm_cli.py on DP-4
    # 或者不知道关了哪块
-   python3 ~/eric/wuyan_github/screen/backend/dm_cli.py restore-all
+   python3 ~/eric/wuyan_github/local_service/screen/backend/dm_cli.py restore-all
    ```
 3. 如果连手边那块屏也黑着，用 `Ctrl+Alt+F3` 切到文本终端执行上面的命令，再 `Ctrl+Alt+F1/F2` 切回图形界面。
 4. 也可以 `xrandr --output DP-4 --auto` 先亮起来，再用本工具的 `on` 校正位置/缩放。
@@ -427,7 +427,7 @@ python3 backend/dm_cli.py brightness set  DP-0 60     # 0~100
 | 屏幕输出管理 | 8765 | `screen-manager.service`（systemd **用户**单元） | 不会；下次登录由 `screen-session.desktop` 启动 |
 | 网络管理 usbnicd | 8787 | `usbnicd.service`（systemd **系统**单元，root） | 不会；下次登录由 `usbnic-session.service` 拉起 |
 
-**8787 为什么不是用户单元**：它的代码在 `~/eric/wuyan_github/usb_wireless_network`，官方启动/停止是
+**8787 为什么不是用户单元**：它的代码在 `~/eric/wuyan_github/local_service/usb_wireless_network`，官方启动/停止是
 `scripts/host-start.sh` / `host-stop.sh`，都要 root（`pkexec`/sudo），因为要写 nftables、策略路由、
 TUN、TPROXY，还要读 `/etc/usbnic/hotspot.pass`（0600 root）。实际进程是系统单元 `usbnicd.service`
 （`User=root`、`/usr/bin/python3`、`WorkingDirectory=.../host`、配置 `host/config/host.yaml`、
@@ -443,9 +443,9 @@ TUN、TPROXY，还要读 `/etc/usbnic/hotspot.pass`（0600 root）。实际进�
 这三件事需要一次性 sudo（脚本只打印、不代跑）：
 
 ```bash
-sudo install -D -m 644 ~/eric/wuyan_github/screen/systemd/usbnicd-session.conf \
+sudo install -D -m 644 ~/eric/wuyan_github/local_service/screen/systemd/usbnicd-session.conf \
   /etc/systemd/system/usbnicd.service.d/10-screen-session.conf
-sudo install -D -m 644 ~/eric/wuyan_github/screen/systemd/49-screen-usbnicd.rules \
+sudo install -D -m 644 ~/eric/wuyan_github/local_service/screen/systemd/49-screen-usbnicd.rules \
   /etc/polkit-1/rules.d/49-screen-usbnicd.rules
 sudo systemctl daemon-reload
 ```
