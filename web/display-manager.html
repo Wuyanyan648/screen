@@ -194,13 +194,6 @@
   }
   #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   #toast.err{border-color:#8b2c2c;background:#2a1414;color:#ffb3ad}
-  #autoBar{
-    position:fixed;left:50%;bottom:76px;transform:translateX(-50%);
-    display:none;align-items:center;gap:12px;z-index:55;
-    background:#1b2430;border:1px solid #2ea043;border-radius:9px;padding:9px 14px;font-size:12.5px;
-    box-shadow:0 10px 30px rgba(0,0,0,.5);
-  }
-  #autoBar.show{display:flex}
   #logBox{
     display:none;position:fixed;right:16px;bottom:16px;width:min(620px,46vw);max-height:44vh;
     overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:10px;
@@ -267,21 +260,11 @@
     <h2 id="mTitle">确认关闭</h2>
     <div class="rows" id="mRows"></div>
     <div id="mWarn"></div>
-    <div class="toggleRow" id="mAutoRow" style="display:none">
-      <button type="button" id="mAutoToggle" class="toggleBtn on">
-        <span class="dot"></span><span id="mAutoText">关掉后 20 秒自动开回来</span>
-      </button>
-    </div>
     <div class="modalActions">
       <button id="mCancel">取消</button>
       <button id="mOk" class="danger">确认关闭</button>
     </div>
   </div>
-</div>
-
-<div id="autoBar">
-  <span id="autoBody"></span>
-  <button id="autoCancel" class="ghost">取消自动恢复</button>
 </div>
 
 <div id="modeBar">
@@ -296,15 +279,12 @@
 <script>
 const $ = s => document.querySelector(s);
 const POLL_MS = 2000;
-const AUTO_RESTORE_MS = 20000;
 
 let state = null;
 let selected = null;
 let busy = false;
 let dialogOpen = false;
 let connected = null;        // null=未知 true=已连接 false=断开
-let autoRestoreWanted = true;
-let autoTimer = null;
 let lastSig = null;          // 结构签名：没变化就不重建 DOM，避免每 2 秒重绘导致按钮点不中
 let brightTimer = {};        // 每块屏的节流定时器
 let brightDraft = {};        // 拖动中的本地值
@@ -1329,22 +1309,10 @@ async function doOff(name){
     warns.push(`这是笔记本内屏（${name}），关掉后笔记本自带面板会黑屏；` +
                `画面会留在剩下的 ${rest.length} 块屏上（${rest.map(x=>x.name).join(', ') || '无'}）。`);
   }
-  if(selfScreen) warns.push('这个界面正好在这块屏上，关掉后界面会从眼前消失；可用下面默认勾选的「自动开回来」，或命令行恢复。');
+  if(selfScreen) warns.push('这个界面正好在这块屏上，关掉后界面会从眼前消失；需要时按 Ctrl+Alt+Shift+F12 恢复全部，或用命令行重新开启。');
   if(o.primary) warns.push('这是 primary 屏，关闭后 primary 会转移到别的屏。');
   $('#mWarn').innerHTML = warns.length
     ? `<div class="dangerBox">⚠ ${warns.join('<br>⚠ ')}</div>` : '';
-
-  // 只有关掉「界面自己所在的屏」才提供自动开回的保险
-  const autoRow = $('#mAutoRow');
-  if(selfScreen){
-    autoRow.style.display = 'flex';
-    autoRestoreWanted = true;
-    $('#mAutoToggle').className = 'toggleBtn on';
-    $('#mAutoText').textContent = `关掉后 ${AUTO_RESTORE_MS/1000} 秒自动开回来（推荐）`;
-  }else{
-    autoRow.style.display = 'none';
-    autoRestoreWanted = false;
-  }
 
   dialogOpen = true;
   $('#mask').classList.add('show');
@@ -1362,7 +1330,6 @@ async function doOff(name){
   if(r.ok){
     toast(r.message || `已关闭 ${name}`);
     if(r.state){ state = r.state; render(); }
-    if(selfScreen && autoRestoreWanted) scheduleAutoRestore(name);
   }else{
     toast('关闭失败：' + (r.error||'未知错误'), true);
   }
@@ -1377,7 +1344,6 @@ async function doOn(name){
     toast((r.message||`已开启 ${name}`) + (r.geometry ? `（${r.geometry}）` : '') +
           (r.warning ? ' ｜ 注意: ' + r.warning : ''));
     if(r.state){ state = r.state; render(); }
-    clearAutoRestore(true);
   }else{
     toast('开启失败：' + (r.error||'未知错误'), true);
   }
@@ -1393,29 +1359,7 @@ async function doRestoreAll(){
   refresh(false);
 }
 
-/* 自动开回：关掉界面自己所在的屏后，页面仍在后台运行，到点自动开回来 */
-function scheduleAutoRestore(name){
-  clearAutoRestore(false);
-  $('#autoBody').textContent =
-    `${name} 已关闭，${AUTO_RESTORE_MS/1000} 秒后自动开回来…`;
-  $('#autoBar').classList.add('show');
-  autoTimer = setTimeout(async ()=>{
-    autoTimer = null;
-    const r = await post('/api/on', {name});
-    toast(r.ok ? `已自动开回 ${name}` : '自动开回失败：' + (r.error||'未知错误'), !r.ok);
-    clearAutoRestore(true);
-    refresh(false);
-  }, AUTO_RESTORE_MS);
-}
-
-function clearAutoRestore(silent){
-  if(autoTimer){ clearTimeout(autoTimer); autoTimer = null; }
-  if($('#autoBar').classList.contains('show')){
-    $('#autoBar').classList.remove('show');
-    if(!silent) toast('已取消自动恢复；这块屏可以用「恢复全部」再开回来');
-  }
-}
-
+/* 关屏就是关屏：不再有定时自动开回，只有用户点「开启」或按恢复全部才会再亮 */
 async function showLog(){
   const box = $('#logBox');
   box.classList.toggle('show');
@@ -1428,17 +1372,8 @@ async function showLog(){
 $('#btnRefresh').onclick = ()=> refresh(true);
 $('#btnRestore').onclick = ()=> doRestoreAll();
 $('#btnLog').onclick = showLog;
-$('#autoCancel').onclick = ()=> clearAutoRestore(false);
 $('#modeKeep').onclick = ()=> keepMode();
 $('#modeUndo').onclick = ()=> undoMode();
-$('#mAutoToggle').onclick = ()=>{
-  autoRestoreWanted = !autoRestoreWanted;
-  const b = $('#mAutoToggle');
-  b.className = 'toggleBtn' + (autoRestoreWanted ? ' on' : '');
-  $('#mAutoText').textContent = autoRestoreWanted
-    ? `关掉后 ${AUTO_RESTORE_MS/1000} 秒自动开回来（推荐）`
-    : '不自动开回（需要用恢复入口手动救）';
-};
 $('#thresholdSel').onchange = async e=>{
   const v = Number(e.target.value);
   const r = await post('/api/config', {idle_threshold: v});
