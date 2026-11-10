@@ -124,6 +124,21 @@
   .bhint summary{cursor:pointer;outline:none}
   .bhint summary:hover{text-decoration:underline}
   .berr{font-size:11px;color:#ffb3ad;line-height:1.55;margin-top:5px;white-space:pre-wrap;word-break:break-word}
+  /* 分辨率 / 刷新率 */
+  .modes{margin-top:9px;border-top:1px dashed var(--line);padding-top:8px}
+  .modes .mcur{margin-left:auto;color:var(--text);font-size:12.5px;font-variant-numeric:tabular-nums}
+  .moderow{display:flex;gap:6px;align-items:center;margin-top:5px}
+  .moderow select{min-width:0;flex:1}
+  .moderow button{padding:4px 10px;font-size:12px;white-space:nowrap}
+  .modes .restore{margin-top:6px;width:100%;padding:4px 8px;font-size:11.5px}
+  #modeBar{
+    position:fixed;left:50%;bottom:76px;transform:translateX(-50%);
+    display:none;align-items:center;gap:12px;z-index:56;max-width:min(880px,94vw);
+    background:#1b2430;border:1px solid #d29922;border-radius:9px;padding:9px 14px;font-size:12.5px;
+    box-shadow:0 10px 30px rgba(0,0,0,.5);
+  }
+  #modeBar.show{display:flex}
+  #modeBar b{color:#ffd28a}
   .asideFoot{padding:10px 12px;border-top:1px solid var(--line)}
   .asideFoot summary{cursor:pointer;color:var(--dim);font-size:12px;outline:none}
   .asideFoot .help{margin-top:8px}
@@ -267,6 +282,12 @@
 <div id="autoBar">
   <span id="autoBody"></span>
   <button id="autoCancel" class="ghost">取消自动恢复</button>
+</div>
+
+<div id="modeBar">
+  <span id="modeBody"></span>
+  <button id="modeKeep" class="primary">保持此设置</button>
+  <button id="modeUndo" class="danger">撤销</button>
 </div>
 
 <div id="toast"></div>
@@ -549,6 +570,11 @@ function renderCards(){
     kv.innerHTML = rows.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join('');
     card.appendChild(kv);
 
+    if(o.enabled){
+      const mwrap = buildModes(o);
+      if(mwrap) card.appendChild(mwrap);
+    }
+
     const bwrap = buildBright(o);
     if(bwrap) card.appendChild(bwrap);
 
@@ -731,6 +757,155 @@ function render(force){
   renderCanvas();
   renderTray();
   renderCards();
+}
+
+/* ---------------- 分辨率 / 刷新率 ---------------- */
+// 只列 xrandr 实际暴露的模式/刷新率（后端解析自 xrandr --current），不臆造；
+// 默认选中当前值。应用只改这块屏的 mode/rate，缩放与位置由后端原样带上。
+function buildModes(o){
+  const info = state.modes && state.modes.outputs && state.modes.outputs[o.name];
+  if(!info || !info.modes || !info.modes.length) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'modes';
+  wrap.dataset.out = o.name;
+
+  const head = document.createElement('div');
+  head.className = 'brightHead';
+  head.innerHTML = `<span>分辨率 / 刷新率</span><b class="mcur">${o.mode} @ ${o.rate} Hz</b>`;
+  wrap.appendChild(head);
+
+  const row = document.createElement('div');
+  row.className = 'moderow';
+
+  const ms = document.createElement('select');
+  ms.className = 'msel';
+  for(const m of info.modes){
+    const opt = document.createElement('option');
+    opt.value = m.mode;
+    opt.textContent = m.mode;
+    if(m.mode === o.mode) opt.selected = true;
+    ms.appendChild(opt);
+  }
+  if(![...ms.options].some(x=>x.selected)) ms.selectedIndex = 0;
+
+  const rs = document.createElement('select');
+  rs.className = 'rsel';
+  const fillRates = ()=>{
+    const m = info.modes.find(x=>x.mode===ms.value) || info.modes[0];
+    rs.innerHTML = '';
+    for(const r of m.rates){
+      const opt = document.createElement('option');
+      opt.value = r.rate;
+      opt.textContent = r.rate + ' Hz' + (r.preferred ? '（首选）' : '');
+      if(m.mode === o.mode && Math.abs(Number(r.rate) - Number(o.rate)) < 0.05) opt.selected = true;
+      rs.appendChild(opt);
+    }
+    if(![...rs.options].some(x=>x.selected)) rs.selectedIndex = 0;
+  };
+  fillRates();
+  ms.onchange = fillRates;
+
+  const btn = document.createElement('button');
+  btn.className = 'primary';
+  btn.textContent = '应用';
+  btn.title = '只改这块屏的模式与刷新率；缩放、位置、primary 原样保留，其他输出不动';
+  btn.onclick = ev=>{ ev.stopPropagation(); applyMode(o.name, ms.value, rs.value); };
+  row.appendChild(ms); row.appendChild(rs); row.appendChild(btn);
+  wrap.appendChild(row);
+
+  const lg = state.modes.last_good;
+  if(lg && lg.name === o.name &&
+     !(lg.mode === o.mode && Math.abs(Number(lg.rate) - Number(o.rate)) < 0.05)){
+    const rb = document.createElement('button');
+    rb.className = 'ghost restore';
+    rb.textContent = `恢复上次可用模式（${lg.mode} @ ${lg.rate} Hz）`;
+    rb.onclick = ev=>{ ev.stopPropagation(); restoreLastMode(); };
+    wrap.appendChild(rb);
+  }
+
+  const note = document.createElement('div');
+  note.className = 'bnote';
+  note.textContent = `只列出这块屏 xrandr 实际暴露的模式。应用后 ${info.confirm_seconds || 15} 秒内`
+    + '不确认会自动退回上一个模式，黑屏也能自动恢复。';
+  wrap.appendChild(note);
+  wrap.onclick = ev=> ev.stopPropagation();
+  return wrap;
+}
+
+let modeTimer = null, modeToken = null;
+
+async function applyMode(name, mode, rate){
+  const o = state.outputs.find(x=>x.name===name);
+  if(o && o.mode === mode && Math.abs(Number(o.rate) - Number(rate)) < 0.05){
+    toast(`${name} 已经是 ${mode} @ ${rate} Hz`);
+    return;
+  }
+  busy = true;
+  const r = await post('/api/modes/apply', {name, mode, rate});
+  busy = false;
+  if(!r.ok){
+    toast('切换失败：' + (r.error || '未知错误'), true);
+    refresh(false);
+    return;
+  }
+  if(r.changed && r.token){
+    startModeConfirm(r);
+    toast(r.message || '模式已切换，请在倒计时内确认');
+  }else{
+    toast(r.message || '模式未变化');
+  }
+  refresh(false);
+}
+
+function startModeConfirm(r){
+  endModeConfirm();
+  modeToken = r.token;
+  let left = Math.round(r.timeout || 15);
+  const paint = ()=>{
+    $('#modeBody').innerHTML = `${r.name} 已切到 <b>${r.applied.mode} @ ${r.applied.rate} Hz</b>`
+      + `，<b>${left}</b> 秒内确认，否则自动退回 ${r.previous.mode} @ ${r.previous.rate} Hz`;
+  };
+  paint();
+  $('#modeBar').classList.add('show');
+  modeTimer = setInterval(()=>{
+    left -= 1;
+    if(left <= 0){
+      endModeConfirm();
+      toast('未确认，已自动退回上一个模式');
+      refresh(false);
+      return;
+    }
+    paint();
+  }, 1000);
+}
+
+function endModeConfirm(){
+  if(modeTimer){ clearInterval(modeTimer); modeTimer = null; }
+  modeToken = null;
+  $('#modeBar').classList.remove('show');
+}
+
+async function keepMode(){
+  const t = modeToken;
+  if(!t) return;
+  endModeConfirm();
+  const r = await post('/api/modes/confirm', {token: t});
+  toast(r.ok ? (r.message || '已保持该模式') : ('确认失败：' + (r.error||'未知错误')), !r.ok);
+  refresh(false);
+}
+
+async function undoMode(){
+  const t = modeToken;
+  endModeConfirm();
+  const r = await post('/api/modes/revert', {token: t || ''});
+  toast(r.ok ? (r.message || '已退回上一个模式') : ('撤销失败：' + (r.error||'未知错误')), !r.ok);
+  refresh(false);
+}
+
+async function restoreLastMode(){
+  const r = await post('/api/modes/revert', {});
+  toast(r.ok ? (r.message || '已恢复上次可用模式') : ('恢复失败：' + (r.error||'未知错误')), !r.ok);
+  refresh(false);
 }
 
 /* ---------------- 亮度滑杆 ---------------- */
@@ -1254,6 +1429,8 @@ $('#btnRefresh').onclick = ()=> refresh(true);
 $('#btnRestore').onclick = ()=> doRestoreAll();
 $('#btnLog').onclick = showLog;
 $('#autoCancel').onclick = ()=> clearAutoRestore(false);
+$('#modeKeep').onclick = ()=> keepMode();
+$('#modeUndo').onclick = ()=> undoMode();
 $('#mAutoToggle').onclick = ()=>{
   autoRestoreWanted = !autoRestoreWanted;
   const b = $('#mAutoToggle');
@@ -1273,12 +1450,12 @@ $('#thresholdSel').onchange = async e=>{
   }
 };
 
-// 自动更新：每 2 秒拉一次状态；关闭弹窗/操作进行中时暂停，避免打架
+// 自动更新：每 2 秒拉一次状态；关闭弹窗/操作进行中/确认窗期间暂停，避免打架
 setInterval(()=>{
-  if(!dialogOpen && !busy) refresh(false);
+  if(!dialogOpen && !busy && !modeTimer) refresh(false);
 }, POLL_MS);
 document.addEventListener('visibilitychange', ()=>{
-  if(!document.hidden && !dialogOpen && !busy) refresh(false);
+  if(!document.hidden && !dialogOpen && !busy && !modeTimer) refresh(false);
 });
 
 buildBreakPanel();

@@ -20,10 +20,12 @@ import dm_brightness  # noqa: E402
 import dm_hotkey  # noqa: E402
 import dm_idle  # noqa: E402
 import dm_break  # noqa: E402
+import dm_modes  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(ROOT, "web")
 LOCK = threading.Lock()  # 串行化 xrandr 操作，避免两个请求同时改布局
+dm_modes.init(LOCK)      # 模式切换自己拿锁（含确认窗超时回滚线程）
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -57,6 +59,7 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 snap = core.snapshot()
                 snap["break"] = dm_break.status()   # 护眼休息不需要额外跑 xrandr
+                snap["modes"] = dm_modes.summary(snap)   # 分辨率/刷新率表 + 记录
                 self._json(snap)
             except core.DMError as e:
                 self._json({"ok": False, "error": str(e)}, 500)
@@ -96,6 +99,21 @@ class Handler(SimpleHTTPRequestHandler):
         body = self._body()
         name = (body.get("name") or "").strip()
         try:
+            # 模式切换自己持有全局 LOCK（确认窗超时回滚线程也在同一把锁上），
+            # 这里不能再包一层 with LOCK，否则非重入锁会死锁。
+            if path.startswith("/api/modes"):
+                if path == "/api/modes/apply":
+                    if not name or not body.get("mode"):
+                        self._json({"ok": False, "error": "缺少输出名或模式"}, 400)
+                        return
+                    self._json(dm_modes.apply(name, body.get("mode"), body.get("rate") or ""))
+                elif path == "/api/modes/confirm":
+                    self._json(dm_modes.confirm(body.get("token") or ""))
+                elif path == "/api/modes/revert":
+                    self._json(dm_modes.revert(body.get("token") or ""))
+                else:
+                    self._json({"ok": False, "error": "未知接口"}, 404)
+                return
             with LOCK:
                 if path == "/api/off":
                     if not name:
@@ -214,6 +232,12 @@ def serve(argv: list[str]) -> int:
 
     # 护眼休息：50/5 分钟定时，到点在指定屏铺一层可跳过的倒计时（状态落盘可恢复）
     dm_break.start()
+
+    # 分辨率/刷新率：收尾上次没确认完的切换（服务被杀/重启也不把屏留在未确认的新模式上）
+    try:
+        dm_modes.start()
+    except Exception as e:
+        core.log("模式切换启动自检异常: %r" % e)
 
     print("display-manager 界面: %s" % url)
     print("闲置检测依据: %s" % rep["basis"])

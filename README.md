@@ -726,6 +726,94 @@ curl -s -X POST 127.0.0.1:8765/api/break -d '{"screen": "HDMI-0"}'
   HDMI-0 状态不变。
 
 
+## 分辨率与刷新率（2026-11-10）
+
+界面里每块**已启用**的输出都有一张「分辨率 / 刷新率」卡片：两个下拉 + 一个「应用」。
+下拉里的每一项都来自该输出 `xrandr --current` 实际打印出来的模式表（`dm_core._parse_query`
+的 `modes` 字段），**没有内置任何型号表，也不会推算**；默认选中当前值，`（首选）` 标记
+EDID 的 preferred 模式。
+
+### 只改这一块屏
+
+应用时一条 xrandr 命令同时下发 `--output NAME --mode M --rate R --transform … --pos … [--primary]`：
+
+- `--rate` 必须显式带上。只给 `--mode 3840x2160` 时 xrandr 会选 EDID preferred 的 60Hz
+  —— 这正是下面「为什么现在跑 60」的直接原因。
+- `transform` 与 `--pos`/`--primary` 取自应用前的快照并原样带回。**transform 必须和 mode 同一条
+  命令下发**，否则分数缩放会掉回 100%，CRTC 几何跟着变成模式尺寸，布局就错位了。
+- 命令里只有目标输出，别的输出一个参数都不带。若 mutter 在 RandR 重配时顺手点亮了
+  `~/.cache/display-manager.off` 名单里的屏，应用后会复查并立刻关回去（名单本身不改）。
+- 内屏/便携屏一样适用；卡片只出现在已启用的输出上，关闭中的输出没有这张卡。
+
+### 安全流程（四步）
+
+1. **先落盘再动手**：应用前把当前时序（模式/刷新率/transform/位置/primary/几何）写进
+   `~/.cache/display-manager.modes.json` 的 `last_good`，并写一条 `pending`。此时即使进程被杀，
+   重启后 `start()` 也能按 `pending` 收尾。
+2. **应用后复核**：重新读 `xrandr`，要求该输出仍启用、模式字符串一致、刷新率误差 ≤ 0.05Hz、
+   transform 未被改动、CRTC 有效。任何一项不符就**立即回滚到 last-known-good**，并把结果
+   （成功/回滚也失败）如实返回。
+3. **确认窗 15 秒**：模式变了以后页面底部出现一条倒计时条「保持此设置 / 撤销」。
+   15 秒内不点「保持」，**后端**自动退回上一个模式（不依赖页面还活着——黑屏时人够不到操作）；
+   点「撤销」也立刻退回。前端倒计时只是提示，真正的超时回滚在服务进程里。
+4. **一键恢复**：卡片上的「恢复上次可用模式（…）」直接回到 `last_good`，不需要记命令行。
+
+`apply`/`confirm`/`revert` 都在全局 `LOCK` 里执行（含超时回滚线程），和关闭/开启/亮度写操作互斥。
+
+### 为什么 DP-0 之前跑在 4K@60
+
+**已证实**：
+
+| 证据 | 结果 |
+| --- | --- |
+| `xrandr --query` 的 DP-0 模式表 | 3840x2160 在 160/144/120.01/100/75/60/29.98 全部暴露 |
+| `~/.cache/hdmi-watchdog.layout` 旧基线 | 曾记录 `DP-0 3840x2160 160.00 0x0 5120x2880+0+0`，160 跑过 |
+| `~/.config/monitors.xml`（mtime 2026-11-09 04:38） | 只有 1080p/1440p 旧组合，**没有** 4K+1.3333 → 排除 mutter 按它回退 |
+| `~/.cache/display-manager.state` 与服务日志 | 没有 DP-0 的开启/mode 下发记录 → 不是本服务设的 |
+| 手动 `xrandr --output DP-0 --mode 3840x2160 --rate 160.00` | rc=0，mode 切到 `0x1be`（1377.08MHz），transform 与画布不变 → 排除带宽/线材 |
+| `--brightness/--gamma` | 只改 gamma ramp，不动模式（实测刷新率不变） |
+
+**结论**：不是配置被记录成 60，也不是 mutter/monitors.xml 回退，更不是线材带宽不够。
+
+**推测（无直接证据）**：某次布局下发只给了 `--mode 3840x2160` 而没给 `--rate`，xrandr 按 EDID
+preferred 选了 60Hz。Xorg 日志对该输出的模式变更记录级别不足，指认不到具体那条命令。
+现在这个入口把 `--rate` 变成必填并会复核，同类「静默掉回 60」不会再发生。
+
+### 与亮度 / 色温 / 护眼休息 / 看门狗的共存
+
+- RandR 重配会把 gamma 复位，应用成功后自动调 `dm_brightness.reapply_software()` 与
+  `reapply_for()`，并按原通道补发；DP-0 的 `software` 锁定不受影响。
+- 应用成功后把新时序写回 `~/.cache/hdmi-watchdog.layout` 里该输出的那一行（其余行不动），
+  看门狗不会拿旧模式当基线又改回去。
+- 护眼休息覆盖层运行期间（`phase == "break"`）拒绝切换，提示等覆盖层结束——覆盖层是按旧几何
+  铺的，中途改模式会错位。
+- 应用后作废实时快照缓存，避免拖动亮度时用到旧几何。
+
+### API
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/state` | `modes.outputs[name].modes` 是模式表，`current` 是当前值；另有 `pending`、`last_good`、`confirm_seconds` |
+| POST | `/api/modes/apply` | `{"name","mode","rate"}` → `{ok, changed, token, timeout, previous, applied, warnings}`；失败已自动回滚 |
+| POST | `/api/modes/confirm` | `{"token"}` 保持当前模式 |
+| POST | `/api/modes/revert` | `{"token"}` 撤销确认窗；不带 token（或没有 pending）时退回 `last_good` |
+
+### 验证记录（本机，2026-11-10 08:45–08:52，真机 DP-0，HDMI-0 关闭、DP-4 关闭）
+
+| 步骤 | 模式（mode id） | Transform | 画布 | HDMI-0 / DP-4 | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| 起始 | 3840x2160@60 (`0x1bd`) | 1.333328 | 5120x2880 | 关闭 / 关闭 | 与用户报告一致 |
+| API 切 160 + 保持 | 3840x2160@160 (`0x1be`) | 1.333313 | 5120x2880 | 关闭 / 关闭 | 复核通过，基线同步为 160 |
+| API 切 60 + 保持 | 3840x2160@60 (`0x1bd`) | 1.333313 | 5120x2880 | 关闭 / 关闭 | 等 16 秒仍保持（未被超时回滚） |
+| 切 60 后不确认 | 先 60，15 秒后 160 (`0x1be`) | 不变 | 5120x2880 | 关闭 / 关闭 | 超时自动退回，日志「确认窗超时…自动退回」 |
+| 切 60 后点「撤销」 | 先 60，立即回 160 (`0x1be`) | 不变 | 5120x2880 | 关闭 / 关闭 | 撤销生效，pending 清空 |
+| 「恢复上次可用模式」 | 60 → last_good 160 (`0x1be`) | 不变 | 5120x2880 | 关闭 / 关闭 | 一键退回生效 |
+| 请求未暴露的模式 | 拒绝：`1234x567@60`、`3840x2160@91.00`（都不在模式表里）；对关闭中的 DP-4 也拒绝 | — | — | — | 返回明确错误，不改布局 |
+
+每次切换后 `Brightness: 0.50 / Gamma: 1.0:1.0:1.0` 都自动补回，亮度锁仍是
+`{"mode":"software","lock":"software"}`。字体/缩放未被改动。
+
+
 ## 界面把自己的屏关掉了怎么救
 
 1. 最快：按全局快捷键 **`Ctrl+Alt+Shift+F12`**（恢复全部），不需要浏览器、不需要切终端。
@@ -998,6 +1086,7 @@ systemctl show -p MemoryCurrent   15691776（15.0 MiB） / 14393344（13.7 MiB�
 | `~/.cache/display-manager.log` | 操作日志（含 xrandr 原始 stderr、快捷键注册/触发） |
 | `~/.cache/display-manager.brightness.json` | 每块屏上次的亮度值、通道与软件叠加层（`extra`） |
 | `~/.cache/display-manager.break.json` | 护眼休息：开关、时长、目标屏、当前轮次与剩余秒数、跳过记录 |
+| `~/.cache/display-manager.modes.json` | 分辨率/刷新率：`last_good`（上次可用时序）与未确认切换的 `pending` |
 | `~/.config/display-manager/config.json` | 闲置阈值（默认 300 秒，0 = 关闭提醒） |
 | `~/.config/systemd/user/screen-manager.service` | 8765 的用户单元（`install-autostart.sh` 生成） |
 | `~/.config/systemd/user/screen-portal.service` | 8760 门户的用户单元 |
@@ -1005,7 +1094,7 @@ systemctl show -p MemoryCurrent   15691776（15.0 MiB） / 14393344（13.7 MiB�
 | `~/.config/autostart/screen-session.desktop` | 会话就绪后导入 DISPLAY 并启动 8765 单元 |
 | `~/.config/autostart/screen-portal-open.desktop` | 登录后自动打开门户（可删） |
 | `portal/services.json` | 门户的服务清单（改完 5 秒内热加载） |
-| `~/.cache/hdmi-watchdog.layout` | 看门狗的基线，本工具**只读**，用作没有关闭记录时的恢复兜底 |
+| `~/.cache/hdmi-watchdog.layout` | 看门狗的基线，用作没有关闭记录时的恢复兜底；切换分辨率后本工具会把目标输出的新时序写回它那一行（其余行不动） |
 
 `.gitignore` 已排除日志、状态、`__pycache__`、截图等运行时产物。
 

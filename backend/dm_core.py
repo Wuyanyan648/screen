@@ -85,6 +85,7 @@ SCREEN_RE = re.compile(
     r"Screen \d+: minimum (\d+) x (\d+), current (\d+) x (\d+), maximum (\d+) x (\d+)"
 )
 MODE_RE = re.compile(r"^\d+x\d+$")
+RATE_RE = re.compile(r"(\d+(?:\.\d+)?)([*+]*)")
 
 
 class DMError(Exception):
@@ -155,6 +156,7 @@ def _parse_query(text: str) -> dict:
                     "primary": " primary" in " " + rest,
                     "x": None, "y": None, "w": None, "h": None,
                     "mode": None, "rate": None,
+                    "modes": [],          # 该输出实际暴露的模式/刷新率（界面切换用）
                     "physical_mm": None,
                 }
                 gm = GEOM_RE.search(line)
@@ -174,6 +176,24 @@ def _parse_query(text: str) -> dict:
         toks = line.split()
         if not toks or not MODE_RE.match(toks[0]):
             continue
+        # 完整模式表：同一个尺寸下可能有多条刷新率，`*`=当前、`+`=首选。
+        # xrandr 里 `*` 可能贴在数字后（160.00*），`+` 可能是单独一个 token（60.00 +）
+        entry = {"mode": toks[0], "rates": []}
+        for t in toks[1:]:
+            if t and set(t) <= {"*", "+"} and entry["rates"]:
+                entry["rates"][-1]["current"] |= "*" in t
+                entry["rates"][-1]["preferred"] |= "+" in t
+                continue
+            rm = RATE_RE.fullmatch(t)
+            if not rm:
+                continue
+            entry["rates"].append({
+                "rate": "%.2f" % float(rm.group(1)),
+                "current": "*" in rm.group(2),
+                "preferred": "+" in rm.group(2),
+            })
+        if entry["rates"]:
+            cur["modes"].append(entry)
         hit = [t for t in toks[1:] if "*" in t]
         if hit:
             cur["mode"] = toks[0]
@@ -415,6 +435,11 @@ def _snapshot_for_live(ttl: float = 1.0) -> dict:
     snap = snapshot()
     _LIVE_SNAP.update(ts=now, snap=snap)
     return snap
+
+
+def invalidate_live_snapshot() -> None:
+    """布局变化后作废「拖动亮度」用的 1 秒快照缓存。"""
+    _LIVE_SNAP.update(ts=0.0, snap=None)
 
 
 def _bbox(outs: list[dict]) -> dict:
