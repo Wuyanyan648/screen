@@ -57,6 +57,9 @@
   .rbox{cursor:pointer}
   .rbox rect{transition:.15s}
   .rbox:hover rect.screen{filter:brightness(1.22)}
+  .ghost{cursor:pointer}
+  .ghost rect.ghostbox{transition:.15s}
+  .ghost:hover rect.ghostbox{fill:rgba(88,166,255,.10);stroke:#58a6ff}
   #offTray{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .chip{
     display:flex;align-items:center;gap:8px;background:var(--panel);border:1px dashed var(--line);
@@ -284,6 +287,7 @@ const POLL_MS = 2000;
 let state = null;
 let selected = null;
 let busy = false;
+let pendingOn = null;       // 正在开启的输出名：幽灵框按钮转 pending，防重复点击
 let dialogOpen = false;
 let connected = null;        // null=未知 true=已连接 false=断开
 let lastSig = null;          // 结构签名：没变化就不重建 DOM，避免每 2 秒重绘导致按钮点不中
@@ -434,13 +438,18 @@ function renderCanvas(){
     }));
   }
 
-  // 已关闭输出的幽灵框：空心虚线、无按钮，明确不是正在生效的桌面
+  // 已关闭输出的幽灵框：空心虚线，整块可点（= 开启入口），落点写明
   for(const o of ghosts){
     const p = o.restore_preview;
     const [gw, gh] = gwh(o);
     const [gx, gy] = p.pos;
-    const g = svgEl('g', {style:'cursor:pointer'});
+    const pending = pendingOn === o.name;
+    const g = svgEl('g', {class:'ghost', style: pending ? 'cursor:progress' : 'cursor:pointer'});
+    const tip = svgEl('title', {});
+    tip.textContent = `开启 ${o.name}：${p.mode}@${p.rate}Hz，落在 ${gx},${gy}（${gw}×${gh}）`;
+    g.appendChild(tip);
     g.appendChild(svgEl('rect', {
+      class:'ghostbox',
       x:gx, y:gy, width:gw, height:gh, rx:Math.min(gw,gh)*0.012,
       fill:'rgba(148,163,184,.045)', stroke:'#55606d',
       'stroke-width':Math.max(2, Math.min(gw,gh)*0.003),
@@ -457,7 +466,11 @@ function renderCanvas(){
        s:fs*0.8, c: p.relocated && p.source !== 'layout' ? '#d29922' : '#6e7b88'},
     ];
     for(const ln of lines){ svgText(g, gx+gw/2, ty, ln.t, ln.s, ln.c, ln.w); ty += ln.s*1.45; }
-    g.addEventListener('click', ()=>{ selected = o.name; render(true); });
+    // 明确按钮：点整块和点按钮都走同一个 doOn（与侧栏「开启」同一条后端路径）
+    svgButton(g, {x:gx, y:gy, w:gw, h:gh},
+              pending ? '开启中…' : `开启（${gx},${gy}）`, pending, false,
+              ()=> doOn(o.name));
+    g.addEventListener('click', ()=>{ if(pendingOn || busy) return; doOn(o.name); });
     svg.appendChild(g);
   }
 
@@ -1523,15 +1536,28 @@ async function doOff(name){
 }
 
 async function doOn(name){
+  // 布局图幽灵框与侧栏按钮共用：进行中再次点击直接忽略，避免并发 xrandr
+  if(busy || pendingOn) return;
+  pendingOn = name;
   busy = true;
-  const r = await post('/api/on', {name});
+  render(true);                     // 幽灵框按钮立刻转 pending
+  const breaking = !!(state && state.break && state.break.overlay);
+  let r;
+  try{
+    r = await post('/api/on', {name});
+  }catch(e){
+    r = {ok:false, error:'与本地服务的连接中断：' + (e && e.message ? e.message : e)};
+  }
+  pendingOn = null;
   busy = false;
   if(r.ok){
     toast((r.message||`已开启 ${name}`) + (r.geometry ? `（${r.geometry}）` : '') +
-          (r.warning ? ' ｜ 注意: ' + r.warning : ''));
-    if(r.state){ state = r.state; render(); }
+          (r.warning ? ' ｜ 注意: ' + r.warning : '') +
+          (breaking ? ' ｜ 护眼休息进行中：遮罩只盖住休息前已亮的屏，这块屏不受遮挡' : ''));
+    if(r.state){ state = r.state; render(true); }
   }else{
     toast('开启失败：' + (r.error||'未知错误'), true);
+    render(true);                   // 恢复按钮可点，允许重试
   }
   refresh(false);
 }
