@@ -207,7 +207,7 @@
 <header>
   <h1>显示器输出管理</h1>
   <span id="conn" class="conn">● 连接中…</span>
-  <div class="meta">画布 <b id="canvasSize">-</b> · 启用 <b id="enabledCount">-</b> 块 · 更新于 <b id="stamp">-</b></div>
+  <div class="meta">固定布局 <b id="canvasSize">-</b> · 当前 <b id="canvasLive">-</b> · 启用 <b id="enabledCount">-</b> 块 · 更新于 <b id="stamp">-</b></div>
   <div class="spacer"></div>
   <label class="meta" style="display:flex;align-items:center;gap:6px">
     闲置阈值
@@ -232,6 +232,7 @@
     <div id="canvasWrap">
       <svg id="layout" xmlns="http://www.w3.org/2000/svg"></svg>
     </div>
+    <div id="layoutBar"></div>
     <div id="offTray"></div>
   </div>
 
@@ -411,11 +412,13 @@ function renderCanvas(){
   // 已关闭但有恢复记录的输出：只画虚线幽灵框，预告「点开启后会放在这里」（后端已算好避让位置）
   const ghosts = state.outputs.filter(o=>o.restore_preview);
   const gwh = g => g.restore_preview.geometry.split('x').map(Number);
-  const pad = Math.max(...on.map(o=>o.h)) * 0.025;
+  const box = state.canvas;          // 规范布局的 union：所有输出都在框内，跟着开关不变
+  const pad = Math.max(...on.map(o=>o.h), box ? box.h : 0) * 0.025;
   const xs0 = on.map(o=>o.x).concat(ghosts.map(g=>g.restore_preview.pos[0]));
   const ys0 = on.map(o=>o.y).concat(ghosts.map(g=>g.restore_preview.pos[1]));
   const xs1 = on.map(o=>o.x+o.w).concat(ghosts.map(g=>g.restore_preview.pos[0]+gwh(g)[0]));
   const ys1 = on.map(o=>o.y+o.h).concat(ghosts.map(g=>g.restore_preview.pos[1]+gwh(g)[1]));
+  if(box){ xs0.push(box.x); ys0.push(box.y); xs1.push(box.x+box.w); ys1.push(box.y+box.h); }
   const x0 = Math.min(...xs0) - pad;
   const y0 = Math.min(...ys0) - pad;
   const x1 = Math.max(...xs1) + pad;
@@ -423,8 +426,6 @@ function renderCanvas(){
   svg.setAttribute('viewBox', `${x0} ${y0} ${x1-x0} ${y1-y0}`);
   svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
 
-  // 画布虚线框只由「已启用输出」的 union 决定（后端 canvas 字段），幽灵框不参与
-  const box = state.canvas;
   if(box){
     svg.appendChild(svgEl('rect', {
       x: box.x, y: box.y, width: box.w, height: box.h, fill:'none',
@@ -451,8 +452,9 @@ function renderCanvas(){
       {t:`${o.name} · 已关闭`, s:fs*1.15, c:'#8b98a5', w:600},
       {t:`开启后 ${gw}×${gh} @ ${gx},${gy}`, s:fs*0.8, c:'#6e7b88'},
       {t:`${p.mode}  ${p.rate}Hz`, s:fs*0.8, c:'#6e7b88'},
-      {t: p.relocated ? `已避开正在用的屏（原记录 ${p.want[0]},${p.want[1]}）` : '按关闭前的位置放回',
-       s:fs*0.8, c: p.relocated ? '#d29922' : '#6e7b88'},
+      {t: p.source === 'layout' ? '固定布局位置 · 开启后即在此处' :
+          (p.relocated ? `已避开正在用的屏（原记录 ${p.want[0]},${p.want[1]}）` : '按关闭前的位置放回'),
+       s:fs*0.8, c: p.relocated && p.source !== 'layout' ? '#d29922' : '#6e7b88'},
     ];
     for(const ln of lines){ svgText(g, gx+gw/2, ty, ln.t, ln.s, ln.c, ln.w); ty += ln.s*1.45; }
     g.addEventListener('click', ()=>{ selected = o.name; render(true); });
@@ -475,6 +477,20 @@ function renderCanvas(){
     });
     rect.addEventListener('click', ()=>{ selected = o.name; render(true); });
     gw.appendChild(rect);
+
+    // 实际位置和固定布局不一致：把固定位置用琥珀虚线标出来（它只是提醒会落回哪，不是另一块屏）
+    if(o.drift){
+      const [dw, dh] = o.drift.geometry.split('x').map(Number);
+      gw.appendChild(svgEl('rect', {
+        x:o.drift.pos[0], y:o.drift.pos[1], width:dw, height:dh, rx:Math.min(dw,dh)*0.012,
+        fill:'none', stroke:'#d29922', 'stroke-width':Math.max(2, Math.min(dw,dh)*0.004),
+        'stroke-dasharray':`${Math.max(10, dh*0.02)} ${Math.max(8, dh*0.014)}`,
+        'pointer-events':'none'
+      }));
+      svgText(gw, o.drift.pos[0]+dw/2, o.drift.pos[1]+dh*0.5,
+              `固定位置 ${o.drift.pos[0]},${o.drift.pos[1]}（关掉再开会落回这里）`,
+              Math.max(22, Math.min(64, dh*0.045)), '#d29922', 600);
+    }
 
     // 闲置：只把底色压暗，文字与按钮保持可读
     if(o.idle){
@@ -586,6 +602,85 @@ function renderTray(){
   }
 }
 
+function renderLayoutBar(){
+  const bar = $('#layoutBar');
+  const lay = state.layout || {outputs:{}, confirmed:false, updated:null};
+  const names = Object.keys(lay.outputs).sort();
+  bar.innerHTML = '';
+  if(!names.length) return;
+
+  const line = document.createElement('div');
+  line.className = 'tray';
+  const label = document.createElement('span');
+  label.className = 'meta';
+  label.textContent = '固定布局（开关屏只改亮灭，坐标不动）：' +
+    names.map(n=>`${n} ${lay.outputs[n].pos.join(',')}`).join(' · ');
+  line.appendChild(label);
+  if(!lay.confirmed){
+    const w = document.createElement('span');
+    w.className = 'meta';
+    w.style.color = '#d29922';
+    w.textContent = '· 待你确认';
+    line.appendChild(w);
+  }
+
+  const mk = (text, fn, cls) => {
+    const b = document.createElement('button');
+    b.textContent = text;
+    if(cls) b.className = cls;
+    b.onclick = fn;
+    return b;
+  };
+  const run = async (body, okMsg) => {
+    try{
+      const j = await post('/api/layout', body);
+      if(j.ok === false) throw new Error(j.error || '未知错误');
+      toast(okMsg);
+      refresh();
+    }catch(e){ toast(okMsg + '失败：' + e.message, true); }
+  };
+  if(!lay.confirmed){
+    line.appendChild(mk('确认这份布局', ()=>run({action:'confirm'}, '已把这份摆位固化为规范布局'), 'primary'));
+  }
+  line.appendChild(mk('按当前实际布局认领',
+    ()=>run({action:'claim'}, '已按当前实际布局认领')));
+  bar.appendChild(line);
+
+  // 手工改坐标：两块屏的固定位置重叠时后端会拒绝，不会把重叠写进规范布局
+  const det = document.createElement('details');
+  det.style.marginTop = '6px';
+  const sum = document.createElement('summary');
+  sum.className = 'meta';
+  sum.textContent = '调整固定坐标（改完点保存即可，不影响当前亮着的屏）';
+  det.appendChild(sum);
+  const ed = document.createElement('div');
+  ed.className = 'tray';
+  ed.style.marginTop = '6px';
+  const inputs = {};
+  for(const n of names){
+    const wrap = document.createElement('label');
+    wrap.className = 'meta';
+    wrap.style.display = 'flex';
+    wrap.style.alignItems = 'center';
+    wrap.style.gap = '4px';
+    wrap.textContent = n;
+    const ix = document.createElement('input');
+    ix.type = 'number'; ix.value = lay.outputs[n].pos[0]; ix.style.width = '90px';
+    const iy = document.createElement('input');
+    iy.type = 'number'; iy.value = lay.outputs[n].pos[1]; iy.style.width = '90px';
+    wrap.appendChild(ix); wrap.appendChild(iy);
+    inputs[n] = [ix, iy];
+    ed.appendChild(wrap);
+  }
+  ed.appendChild(mk('保存固定坐标', ()=>{
+    const pos = {};
+    for(const n of names) pos[n] = [Number(inputs[n][0].value), Number(inputs[n][1].value)];
+    run({action:'set', pos}, '固定坐标已保存');
+  }, 'primary'));
+  det.appendChild(ed);
+  bar.appendChild(det);
+}
+
 function renderCards(){
   const box = $('#cards');
   box.innerHTML = '';
@@ -606,18 +701,20 @@ function renderCards(){
     const kv = document.createElement('div');
     kv.className = 'kv';
     const p = o.restore_preview;
+    const canon = o.canonical;
     const rows = o.enabled ? [
       ['分辨率', `${o.w}×${o.h}`],
       ['模式', `${o.mode} @ ${o.rate} Hz`],
-      ['位置', `${o.x}, ${o.y}`],
+      ['位置', `${o.x}, ${o.y}${canon ? (o.drift ? `（固定 ${canon.pos[0]},${canon.pos[1]}，当前偏离）` : '（= 固定布局）') : ''}`],
       ['缩放', `${o.scale ? o.scale.toFixed(0)+'%' : '-'}`],
       ['画面静止', o.idle_seconds === null ? '-' : fmtDur(o.idle_seconds)],
     ] : [
-      ['状态', '已关闭'],
+      ['状态', '已关闭（坐标不变）'],
       ...(p ? [
-        ['开启后位置', `${p.pos[0]}, ${p.pos[1]}${p.relocated ? '（已避开正在用的屏）' : ''}`],
+        ['开启后位置', `${p.pos[0]}, ${p.pos[1]}${p.source === 'layout' ? '（固定布局）' : (p.relocated ? '（临时避让）' : '')}`],
         ['开启后几何', `${p.geometry} · ${p.mode} @ ${p.rate} Hz · 缩放 ${p.scale.toFixed(0)}%`],
-        ['关闭前记录', `${p.want[0]}, ${p.want[1]}${p.relocated ? ' · 会压住现有屏，已弃用' : ''}`],
+        ['几何来源', p.source === 'layout' ? '规范布局 · 关闭不改' :
+                     (p.source === 'state' ? '旧四件套（待认领）' : '看门狗基线（待认领）')],
       ] : [['恢复参数', '无记录，只能按 xrandr 默认（--auto）']]),
     ];
     kv.innerHTML = rows.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join('');
@@ -788,6 +885,8 @@ function structuralSig(s){
     th: s.config && s.config.idle_threshold,
     basis: s.idle && s.idle.basis,
     ov: s.overlaps || [],
+    lay: s.layout ? [s.layout.confirmed, s.layout.updated,
+                     Object.keys(s.layout.outputs||{}).sort().map(k=>[k, s.layout.outputs[k].pos.join(',')])] : null,
     sel: selected,
     o: s.outputs.map(o=>[
       o.name, o.status, o.enabled, o.primary, o.panel, o.off_marked, o.idle,
@@ -795,6 +894,7 @@ function structuralSig(s){
       o.transform ? o.transform[0] : null,
       o.restore_preview ? [o.restore_preview.pos.join(','), o.restore_preview.relocated,
                            o.restore_preview.mode, o.restore_preview.rate].join('|') : null,
+      o.drift ? o.drift.pos.join(',') : null,
       o.idle ? Math.floor((o.idle_seconds||0)/60) : null
     ]),
     // 亮度只放「能力」相关字段；具体数值不进签名，拖动时不重建 DOM
@@ -815,10 +915,12 @@ function render(force){
   if(!force && (sig === lastSig || brightDragging)) return;
   lastSig = sig;
   $('#canvasSize').textContent = fmtCanvas(state.canvas);
+  $('#canvasLive').textContent = fmtCanvas(state.canvas_live);
   $('#enabledCount').textContent = state.enabled_count;
   $('#idleBasis').textContent = state.idle ? state.idle.basis : '-';
   syncThreshold();
   renderCanvas();
+  renderLayoutBar();
   renderTray();
   renderCards();
 }

@@ -329,6 +329,11 @@ def _after_change(rec: dict) -> None:
         core.invalidate_live_snapshot()
     except AttributeError:
         pass
+    # 规范布局是单一几何源：模式/刷新率/transform/几何跟着改，位置不动
+    try:
+        core.layout_update_mode(rec)
+    except Exception as e:
+        _log("同步规范布局失败: %r" % e)
     try:
         import dm_brightness
         dm_brightness.reapply_software()

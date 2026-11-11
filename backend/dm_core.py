@@ -351,6 +351,210 @@ def wd_baseline(name: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
+# 规范布局（单一几何源）
+# --------------------------------------------------------------------------- #
+# 每块输出的「模式 + 刷新率 + transform + 位置 + primary」长期存在这里，与启用状态解耦：
+# 关屏只改 .off，不改坐标；各种开关组合都按这份整体几何摆放。
+LAYOUT_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "layout.json")
+
+# 2026-11-11 首次建库用的实测摆位（用户 GNOME 面板：2 上、1 左下、3 右下）。
+# 现网旧数据里 DP-0 与 DP-4 都记成 0,0（坏数据），不能直接当规范布局；这三个坐标
+# 取自 11-11 01:19 关闭对应输出时记录的真实四件套（日志可查）。只在建库那一次用，
+# 且 confirmed=False，等用户在页面上确认；之后一律以 layout.json 为准。
+MIGRATION_POS = {"DP-0": (0, 0), "DP-4": (881, 2880), "HDMI-0": (4289, 2880)}
+
+
+def _split_geom(g) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d+)x(\d+)", str(g).strip().lower())
+    if not m:
+        raise DMError("几何格式不对: %r" % g)
+    return int(m.group(1)), int(m.group(2))
+
+
+def _entry_of(o: dict) -> dict:
+    return {
+        "mode": o["mode"],
+        "rate": o["rate"],
+        "transform": list(o["transform"] or IDENTITY),
+        "pos": [int(o["x"]), int(o["y"])],
+        "geometry": "%dx%d" % (o["w"], o["h"]),
+        "primary": bool(o["primary"]),
+    }
+
+
+def layout_load() -> dict:
+    try:
+        with open(LAYOUT_FILE, "r") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("outputs"), dict):
+            d.setdefault("version", 1)
+            d.setdefault("confirmed", False)
+            d.setdefault("updated", None)
+            return d
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "confirmed": False, "updated": None, "outputs": {}}
+
+
+def _state_mirror(lay: dict) -> None:
+    """把规范布局镜像进 display-manager.state：两处几何永远一致，不再各说各话。"""
+    lines = []
+    for name, e in sorted(lay["outputs"].items()):
+        lines.append("%s %s %s %d %d %s %s %d" % (
+            name, e["mode"], e["rate"], e["pos"][0], e["pos"][1],
+            ",".join("%.6f" % v for v in (e.get("transform") or IDENTITY)),
+            e["geometry"], 1 if e.get("primary") else 0))
+    _write_lines(STATE_FILE, lines)
+
+
+def layout_save(lay: dict, reason: str = "") -> dict:
+    lay["version"] = 1
+    lay["updated"] = datetime.now().strftime("%F %T")
+    os.makedirs(os.path.dirname(LAYOUT_FILE), exist_ok=True)
+    tmp = LAYOUT_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(lay, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, LAYOUT_FILE)
+    _state_mirror(lay)
+    log("规范布局已保存%s: %s" % ("（%s）" % reason if reason else "",
+        "、".join("%s@%d,%d" % (n, e["pos"][0], e["pos"][1]) for n, e in sorted(lay["outputs"].items()))))
+    return lay
+
+
+def layout_canvas(lay: dict) -> dict | None:
+    rects = []
+    for e in lay["outputs"].values():
+        try:
+            w, h = _split_geom(e["geometry"])
+        except DMError:
+            continue
+        rects.append({"x": e["pos"][0], "y": e["pos"][1], "w": w, "h": h})
+    return _bbox(rects) if rects else None
+
+
+def layout_ensure(outs: list[dict]) -> dict:
+    """第一次建库：从「当前几何 / .state / 看门狗基线」拼一份规范布局，标成待确认。
+
+    撞车的数据一律不采信：DP-0 与 DP-4 都记在 0,0 时，按 MIGRATION_POS 的实测摆位落位。
+    """
+    lay = layout_load()
+    if lay["outputs"]:
+        return lay
+    taken: list[dict] = []
+    entries: dict[str, dict] = {}
+    for o in sorted(outs, key=lambda x: (not x["enabled"], x["name"])):
+        if not o["connected"]:
+            continue
+        base = _entry_of(o) if o["enabled"] else None
+        if base is None:
+            for src in (state_get(o["name"]), wd_baseline(o["name"])):
+                if src:
+                    base = {"mode": src["mode"], "rate": src["rate"],
+                            "transform": list(src["transform"]), "pos": list(src["pos"]),
+                            "geometry": src["geometry"], "primary": bool(src["primary"])}
+                    break
+        if base is None:
+            continue
+        w, h = _split_geom(base["geometry"])
+        cands: list[list[int]] = []
+        # 用户现在的实际摆位优先；只有它和别的屏撞车（历史坏数据）才用实测摆位兜底
+        for pos in (tuple(base["pos"]), MIGRATION_POS.get(o["name"])):
+            if pos and list(pos) not in cands:
+                cands.append(list(pos))
+        pick = None
+        for pos in cands:
+            if not _hits({"x": pos[0], "y": pos[1], "w": w, "h": h}, taken):
+                pick = pos
+                break
+        if pick is None:
+            pick, _ = plan_place(w, h, base["pos"], taken)
+        entries[o["name"]] = dict(base, pos=pick)
+        taken.append({"x": pick[0], "y": pick[1], "w": w, "h": h})
+    lay["outputs"] = entries
+    lay["confirmed"] = False
+    return layout_save(lay, "首次建库，等待确认")
+
+
+def layout_confirm() -> dict:
+    lay = layout_load()
+    lay["confirmed"] = True
+    return layout_save(lay, "用户确认")
+
+
+def layout_claim(outs: list[dict]) -> dict:
+    """把当前实际生效的几何认领为规范布局；实际布局本身重叠就拒绝（不猜）。"""
+    ov = _overlaps(outs)
+    if ov:
+        raise DMError("当前实际布局本身就有重叠（%s），先在 GNOME 里把屏摆开、再点认领"
+                      % "、".join("%s/%s" % (x["a"], x["b"]) for x in ov))
+    lay = layout_load()
+    entries = dict(lay["outputs"])
+    for o in outs:
+        if o["enabled"]:
+            entries[o["name"]] = _entry_of(o)
+    lay["outputs"] = entries
+    lay["confirmed"] = True
+    return layout_save(lay, "按当前实际布局认领")
+
+
+def layout_set_positions(pos: dict) -> dict:
+    """手工改固定坐标：保存前检查互不重叠（不允许把重叠写进规范布局）。"""
+    lay = layout_load()
+    entries = lay["outputs"]
+    if not entries:
+        raise DMError("还没有规范布局，先点「按当前实际布局认领」")
+    for name, xy in pos.items():
+        if name not in entries:
+            continue
+        try:
+            x, y = int(xy[0]), int(xy[1])
+        except (TypeError, ValueError, IndexError):
+            raise DMError("%s 的坐标必须是两个整数" % name)
+        entries[name]["pos"] = [x, y]
+    rects = []
+    for name, e in entries.items():
+        w, h = _split_geom(e["geometry"])
+        rects.append({"name": name, "x": e["pos"][0], "y": e["pos"][1], "w": w, "h": h})
+    for i, a in enumerate(rects):
+        for b in rects[i + 1:]:
+            if (a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"]
+                    and a["y"] < b["y"] + b["h"] and b["y"] < a["y"] + a["h"]):
+                raise DMError("%s 与 %s 的固定位置重叠（%d,%d 对 %d,%d），改开一点再保存"
+                              % (a["name"], b["name"], a["x"], a["y"], b["x"], b["y"]))
+    lay["confirmed"] = True
+    return layout_save(lay, "手动调整固定坐标")
+
+
+def layout_update_mode(rec: dict) -> None:
+    """服务内改了分辨率/刷新率：同步固定布局的 mode/rate/transform/geometry，位置不动。"""
+    lay = layout_load()
+    e = lay["outputs"].get(rec.get("name"))
+    if not e:
+        return
+    for k in ("mode", "rate", "transform", "geometry", "primary"):
+        if k in rec:
+            e[k] = rec[k]
+    layout_save(lay, "%s 改模式" % rec["name"])
+
+
+def layout_action(body: dict) -> dict:
+    """页面上的固定布局操作：确认 / 认领当前实际布局 / 手改坐标。"""
+    action = (body or {}).get("action") or "confirm"
+    snap = snapshot()
+    if action == "confirm":
+        lay = layout_confirm()
+    elif action == "claim":
+        lay = layout_claim(snap["outputs"])
+    elif action == "set":
+        lay = layout_set_positions((body or {}).get("pos") or {})
+    else:
+        raise DMError("未知操作: %r" % action)
+    return {"layout": lay, "state": snapshot()}
+
+
+
+# --------------------------------------------------------------------------- #
 # 快照（界面与 CLI 共用）
 # --------------------------------------------------------------------------- #
 def snapshot() -> dict:
@@ -390,12 +594,25 @@ def snapshot() -> dict:
         })
 
     enabled = [o for o in outputs if o["enabled"]]
-    canvas = _bbox(enabled)
+    lay = layout_load()
+    # 画布按「规范布局」算：所有输出的 union，不随开关组合变化
+    canvas = layout_canvas(lay) or _bbox(enabled)
     # 已关闭输出的「开启后会放这里」预告：只用于画虚线幽灵框，不进 canvas
-    previews = _restore_preview(outputs)
+    previews = _restore_preview(outputs, lay)
     for o in outputs:
         if o["name"] in previews:
             o["restore_preview"] = previews[o["name"]]
+        e = lay["outputs"].get(o["name"])
+        if not e:
+            continue
+        o["canonical"] = e
+        if o["enabled"]:
+            try:
+                w, h = _split_geom(e["geometry"])
+            except DMError:
+                continue
+            if (o["x"], o["y"], o["w"], o["h"]) != (e["pos"][0], e["pos"][1], w, h):
+                o["drift"] = {"pos": e["pos"], "geometry": e["geometry"]}
     # 在关闭名单里却亮着：状态文件被服务之外的操作弄脏了（挂起/恢复、手动 xrandr）
     conflicts = [o["name"] for o in outputs if o["enabled"] and o["off_marked"]]
     idle_info = _attach_idle(outputs, time.time())
@@ -412,6 +629,13 @@ def snapshot() -> dict:
         "brightness": bright,
         "enabled_count": len(enabled),
         "canvas": canvas,
+        "canvas_live": _bbox(enabled),
+        "layout": {
+            "file": LAYOUT_FILE,
+            "confirmed": lay.get("confirmed", False),
+            "updated": lay.get("updated"),
+            "outputs": lay["outputs"],
+        },
         "off_marked": marked,
         "conflicts": conflicts,
         "idle": idle_info,
@@ -518,16 +742,33 @@ def plan_place(w: int, h: int, want, occupied: list[dict]):
     raise DMError("虚拟画布放不下 %dx%d 的输出，为免叠屏不点亮" % (rect["w"], rect["h"]))
 
 
-def _restore_preview(outs: list[dict]) -> dict:
+def _restore_preview(outs: list[dict], lay: dict | None = None) -> dict:
     """给「已关闭但能恢复」的输出算一个落点，供界面画虚线幽灵框。
 
-    幽灵框只是「点开启后会放在这里」的预告：它按 plan_place 提前避开了现有屏，
-    所以永远不会和实心块重叠；画布尺寸（canvas）仍只统计已启用的输出。
+    规范布局里有它的，直接停在它自己的固定位置上（开启后就是这里，与别的屏无关）；
+    没有的，才按 plan_place 临时避让一次。
     """
+    lay = lay or layout_load()
     occ = _enabled_rects(outs)
     res = {}
     for o in outs:
         if not o["connected"] or o["enabled"]:
+            continue
+        e = lay["outputs"].get(o["name"])
+        if e:
+            try:
+                w, h = _split_geom(e["geometry"])
+            except DMError:
+                continue
+            res[o["name"]] = {
+                "source": "layout",
+                "mode": e["mode"], "rate": e["rate"],
+                "geometry": "%dx%d" % (w, h),
+                "want": [e["pos"][0], e["pos"][1]],
+                "pos": [e["pos"][0], e["pos"][1]],
+                "relocated": False,
+                "scale": round(w * 100.0 / (int(e["mode"].split("x")[0]) or 1), 1),
+            }
             continue
         rec = state_get(o["name"])
         src = "state"
@@ -633,7 +874,7 @@ def plan_off(name: str) -> dict:
         "remaining_count": len(rest),
         "canvas_after": _bbox(rest),
         "canvas_now": snap["canvas"],
-        "restore_from": "state" if state_get(name) else (
+        "restore_from": "layout" if name in layout_load()["outputs"] else (
             "watchdog" if wd_baseline(name) else "none"),
     }
 
@@ -644,24 +885,21 @@ def turn_off(name: str, reason: str = "cli") -> dict:
     o = _find(snap, name)
 
     tr = o["transform"] or list(IDENTITY)
-    rec = {
-        "name": name,
-        "mode": o["mode"],
-        "rate": o["rate"],
-        "pos": (o["x"], o["y"]),
-        "transform": tr,
-        "geometry": "%dx%d" % (o["w"], o["h"]),
-        "primary": o["primary"],
-    }
-    state_put(rec)
-    log("记录 %s 的四件套: %s@%s pos=%dx%d transform=%s 几何=%s primary=%s (%s)" % (
-        name, rec["mode"], rec["rate"], rec["pos"][0], rec["pos"][1],
-        ",".join("%.6f" % v for v in rec["transform"]), rec["geometry"],
-        "是" if rec["primary"] else "否", reason))
+    # 关屏不改几何：规范布局里已有它就原样保留；只有第一次见到的新输出才补一条
+    lay = layout_load()
+    if name in lay["outputs"]:
+        log("关闭 %s（关闭不改固定几何 %d,%d，仍按规范布局保留）(%s)" % (
+            name, lay["outputs"][name]["pos"][0], lay["outputs"][name]["pos"][1], reason))
+    else:
+        lay["outputs"][name] = _entry_of(o)
+        layout_save(lay, "关闭 %s 时补登固定几何" % name)
+        log("记录 %s 的固定几何: %s@%s pos=%dx%d transform=%s 几何=%s primary=%s (%s)" % (
+            name, o["mode"], o["rate"], o["x"], o["y"],
+            ",".join("%.6f" % v for v in tr), "%dx%d" % (o["w"], o["h"]),
+            "是" if o["primary"] else "否", reason))
 
     rc, out, err = xrandr(["--output", name, "--off"])
     if rc != 0:
-        state_drop(name)
         detail = (err or out).strip()
         log("关闭 %s 失败 rc=%d ；xrandr stderr: %s" % (name, rc, detail))
         raise DMError("xrandr 关闭 %s 失败（rc=%d）：%s" % (name, rc, detail or "无输出"))
@@ -704,9 +942,18 @@ def turn_on(name: str, reason: str = "cli") -> dict:
         return {"ok": True, "action": "on", "name": name, "state": snap,
                 "message": "%s 已经处于启用状态，无需操作" % name}
 
-    rec, src = _resolve_restore(name)
-    # 关闭期间别的屏可能挪过位置：记录里的位置若会压住正在用的屏，先自动避让。
-    # 位置是恢复四件套里唯一「可能伤到别人」的一项，模式/刷新率/transform 仍按记录走。
+    # 首选规范布局：每块屏在全局几何里的坐标是固定的，先开谁后开谁都不影响
+    lay = layout_load()
+    e = lay["outputs"].get(name)
+    if e:
+        rec = {"name": name, "mode": e["mode"], "rate": e["rate"],
+               "pos": tuple(e["pos"]), "geometry": e["geometry"],
+               "transform": list(e.get("transform") or IDENTITY),
+               "primary": bool(e.get("primary"))}
+        src = "规范布局 %s" % LAYOUT_FILE
+    else:
+        rec, src = _resolve_restore(name)
+    # 兜底：规范布局本身若被手工改重叠了，也不许叠上去（正常路径不会触发）
     want = rec["pos"]
     moved = False
     try:
@@ -906,31 +1153,33 @@ def brightness_state(refresh: bool = False) -> dict:
 
 
 def reconcile(reason: str = "启动") -> list[str]:
-    """对账：亮着的输出不该留在「关闭名单」或「关闭前四件套」里。
+    """对账：规范布局、.off 名单、.state 镜像、看门狗基线四处对齐。
 
-    挂起/恢复、mutter 重新点亮、手动 xrandr 都可能绕过本服务，让状态文件变脏：
+    挂起/恢复、mutter 重新点亮、手动 xrandr 都可能绕过本服务：
     - 在 .off 里却亮着 → 名单失去意义（看门狗会漏判），移除；
-    - 有「关闭前四件套」却亮着 → 那是关闭期间的快照，早就过期（例如 DP-0 记的是
-      4K@160/150%，实际早跑到 4K@60/100%），留着下次开启会把旧位置（常常是 0,0）
-      压回正在用的屏上，删掉。
+    - 规范布局里没有的新输出 → 按当前几何补一条（几何源只有一份，不能缺）；
+    - 亮着的输出偏离固定位置 → 只告警，不擅自挪（挪不挪由用户在 GNOME 里决定）。
 
     只改状态文件，不改任何显示布局。
     """
     snap = snapshot()
+    lay = layout_load()
     notes = []
     for o in snap["outputs"]:
-        if not o["enabled"]:
+        if not o["connected"]:
             continue
-        if o["off_marked"]:
+        if o["enabled"] and o["off_marked"]:
             off_unmark(o["name"])
             notes.append("%s 在 .off 名单里但当前是亮的（多半是挂起/恢复时被系统点亮），已从名单移除"
                          % o["name"])
-        rec = state_get(o["name"])
-        if rec:
-            state_drop(o["name"])
-            notes.append("%s 有已过期的关闭前记录（%s@%s %d,%d 几何 %s），但它现在是亮的，已删除"
-                         % (o["name"], rec["mode"], rec["rate"],
-                            rec["pos"][0], rec["pos"][1], rec["geometry"]))
+        if o["enabled"] and o["name"] not in lay["outputs"]:
+            lay["outputs"][o["name"]] = _entry_of(o)
+            layout_save(lay, "对账补登 %s" % o["name"])
+            notes.append("%s 不在规范布局里，已按当前几何补登 %d,%d" % (o["name"], o["x"], o["y"]))
+        if o.get("drift"):
+            notes.append("%s 当前 %d,%d 偏离固定位置 %d,%d（%s）；要挪回请关掉再开启"
+                         % (o["name"], o["x"], o["y"],
+                            o["drift"]["pos"][0], o["drift"]["pos"][1], o["drift"]["geometry"]))
     for n in notes:
         log("%s对账: %s" % (reason, n))
     return notes

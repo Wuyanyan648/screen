@@ -127,6 +127,8 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(core.turn_on(name, "web"))
                 elif path == "/api/restore":
                     self._json(core.restore_all("web"))
+                elif path == "/api/layout":
+                    self._json(core.layout_action(body))
                 elif path == "/api/plan":
                     self._json({"ok": True, "plan": core.plan_off(name)})
                 elif path == "/api/config":
@@ -238,6 +240,13 @@ def serve(argv: list[str]) -> int:
         dm_modes.start()
     except Exception as e:
         core.log("模式切换启动自检异常: %r" % e)
+
+    # 规范布局：第一次启动时从现有几何/状态文件建库（标成待确认，不擅自套用）
+    try:
+        with LOCK:
+            core.layout_ensure(core.snapshot()["outputs"])
+    except Exception as e:
+        core.log("规范布局建库失败: %r" % e)
 
     # 对账：亮着的输出不该留在 .off 名单或「关闭前四件套」里（挂起/恢复常把它们弄脏）
     try:
