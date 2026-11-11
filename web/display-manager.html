@@ -406,14 +406,24 @@ function renderCanvas(){
     svgText(svg, 50, 32, '当前没有任何启用的输出', 4, '#8b98a5');
     return;
   }
+  // 大块先画、小块后画：真重叠时小块压在上面，和实际「后配置的盖住先配置的」一致
+  const onSorted = on.slice().sort((a,b)=> b.w*b.h - a.w*a.h);
+  // 已关闭但有恢复记录的输出：只画虚线幽灵框，预告「点开启后会放在这里」（后端已算好避让位置）
+  const ghosts = state.outputs.filter(o=>o.restore_preview);
+  const gwh = g => g.restore_preview.geometry.split('x').map(Number);
   const pad = Math.max(...on.map(o=>o.h)) * 0.025;
-  const x0 = Math.min(...on.map(o=>o.x)) - pad;
-  const y0 = Math.min(...on.map(o=>o.y)) - pad;
-  const x1 = Math.max(...on.map(o=>o.x+o.w)) + pad;
-  const y1 = Math.max(...on.map(o=>o.y+o.h)) + pad;
+  const xs0 = on.map(o=>o.x).concat(ghosts.map(g=>g.restore_preview.pos[0]));
+  const ys0 = on.map(o=>o.y).concat(ghosts.map(g=>g.restore_preview.pos[1]));
+  const xs1 = on.map(o=>o.x+o.w).concat(ghosts.map(g=>g.restore_preview.pos[0]+gwh(g)[0]));
+  const ys1 = on.map(o=>o.y+o.h).concat(ghosts.map(g=>g.restore_preview.pos[1]+gwh(g)[1]));
+  const x0 = Math.min(...xs0) - pad;
+  const y0 = Math.min(...ys0) - pad;
+  const x1 = Math.max(...xs1) + pad;
+  const y1 = Math.max(...ys1) + pad;
   svg.setAttribute('viewBox', `${x0} ${y0} ${x1-x0} ${y1-y0}`);
   svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
 
+  // 画布虚线框只由「已启用输出」的 union 决定（后端 canvas 字段），幽灵框不参与
   const box = state.canvas;
   if(box){
     svg.appendChild(svgEl('rect', {
@@ -423,10 +433,36 @@ function renderCanvas(){
     }));
   }
 
+  // 已关闭输出的幽灵框：空心虚线、无按钮，明确不是正在生效的桌面
+  for(const o of ghosts){
+    const p = o.restore_preview;
+    const [gw, gh] = gwh(o);
+    const [gx, gy] = p.pos;
+    const g = svgEl('g', {style:'cursor:pointer'});
+    g.appendChild(svgEl('rect', {
+      x:gx, y:gy, width:gw, height:gh, rx:Math.min(gw,gh)*0.012,
+      fill:'rgba(148,163,184,.045)', stroke:'#55606d',
+      'stroke-width':Math.max(2, Math.min(gw,gh)*0.003),
+      'stroke-dasharray':`${Math.max(8, gh*0.014)} ${Math.max(6, gh*0.01)}`
+    }));
+    const fs = Math.max(22, Math.min(72, gh*0.05));
+    let ty = gy + gh*0.5 - fs*1.6;
+    const lines = [
+      {t:`${o.name} · 已关闭`, s:fs*1.15, c:'#8b98a5', w:600},
+      {t:`开启后 ${gw}×${gh} @ ${gx},${gy}`, s:fs*0.8, c:'#6e7b88'},
+      {t:`${p.mode}  ${p.rate}Hz`, s:fs*0.8, c:'#6e7b88'},
+      {t: p.relocated ? `已避开正在用的屏（原记录 ${p.want[0]},${p.want[1]}）` : '按关闭前的位置放回',
+       s:fs*0.8, c: p.relocated ? '#d29922' : '#6e7b88'},
+    ];
+    for(const ln of lines){ svgText(g, gx+gw/2, ty, ln.t, ln.s, ln.c, ln.w); ty += ln.s*1.45; }
+    g.addEventListener('click', ()=>{ selected = o.name; render(true); });
+    svg.appendChild(g);
+  }
+
   const overlapped = new Set();
   (state.overlaps||[]).forEach(o=>{ overlapped.add(o.a); overlapped.add(o.b); });
 
-  for(const o of on){
+  for(const o of onSorted){
     const sel = o.name === selected;
     const isOv = overlapped.has(o.name);
     const gw = svgEl('g', {class:'rbox'});
@@ -487,6 +523,34 @@ function renderCanvas(){
     }
     svg.appendChild(gw);
   }
+
+  // 真重叠（两块都亮着）：在交集上画红框并点名，避免「大框没标题」看不出是哪块屏
+  for(const ov of (state.overlaps||[])){
+    const a = on.find(o=>o.name===ov.a), b = on.find(o=>o.name===ov.b);
+    if(!a || !b) continue;
+    const ix = Math.max(a.x, b.x), iy = Math.max(a.y, b.y);
+    const iw = Math.min(a.x+a.w, b.x+b.w) - ix;
+    const ih = Math.min(a.y+a.h, b.y+b.h) - iy;
+    if(iw <= 0 || ih <= 0) continue;
+    svg.appendChild(svgEl('rect', {
+      x:ix, y:iy, width:iw, height:ih, fill:'rgba(248,81,73,.07)',
+      stroke:'#f85149', 'stroke-width':Math.max(2, Math.min(iw,ih)*0.004),
+      'stroke-dasharray':`${Math.max(10, ih*0.02)} ${Math.max(7, ih*0.014)}`,
+      'pointer-events':'none'
+    }));
+    const label = `${ov.a} ↔ ${ov.b} 实际重叠 ${ov.w}×${ov.h}`;
+    const bfs = Math.max(22, Math.min(56, Math.min(iw,ih)*0.045));
+    const bw = label.length * bfs * 0.62 + bfs*1.6;
+    const bh = bfs * 1.9;
+    const bx = ix + iw*0.012, by = iy + ih*0.012;
+    const badge = svgEl('g', {style:'pointer-events:none'});
+    badge.appendChild(svgEl('rect', {
+      x:bx, y:by, width:bw, height:bh, rx:bh*0.3,
+      fill:'#3a1a1a', stroke:'#f85149', 'stroke-width':Math.max(2, bfs*0.08)
+    }));
+    svgText(badge, bx+bw/2, by+bh*0.68, label, bfs, '#ffb3ad', 600);
+    svg.appendChild(badge);
+  }
 }
 
 function fmtCanvas(c){ return c ? `${c.w}×${c.h}` : '-'; }
@@ -506,7 +570,7 @@ function renderTray(){
   if(!off.length) return;
   const label = document.createElement('span');
   label.className = 'meta';
-  label.textContent = '未启用的输出（无几何，不画在图上）：';
+  label.textContent = '未启用的输出（虚线框 = 点开启后会放的位置，不参与画布尺寸）：';
   tray.appendChild(label);
   for(const o of off){
     const chip = document.createElement('div');
@@ -535,20 +599,38 @@ function renderCards(){
     if(o.primary) badges.push('<span class="badge info">primary</span>');
     if(o.panel) badges.push('<span class="badge warn">内屏</span>');
     if(o.off_marked) badges.push('<span class="badge">你关闭的</span>');
+    if(o.enabled && o.off_marked) badges.push('<span class="badge dead">名单里却亮着</span>');
     if(o.idle) badges.push(`<span class="badge dead">闲置 ${fmtDur(o.idle_seconds)}</span>`);
     card.innerHTML = `<h3>${o.name} ${badges.join('')}</h3>`;
 
     const kv = document.createElement('div');
     kv.className = 'kv';
+    const p = o.restore_preview;
     const rows = o.enabled ? [
       ['分辨率', `${o.w}×${o.h}`],
       ['模式', `${o.mode} @ ${o.rate} Hz`],
       ['位置', `${o.x}, ${o.y}`],
       ['缩放', `${o.scale ? o.scale.toFixed(0)+'%' : '-'}`],
       ['画面静止', o.idle_seconds === null ? '-' : fmtDur(o.idle_seconds)],
-    ] : [['状态', '已关闭，无几何']];
+    ] : [
+      ['状态', '已关闭'],
+      ...(p ? [
+        ['开启后位置', `${p.pos[0]}, ${p.pos[1]}${p.relocated ? '（已避开正在用的屏）' : ''}`],
+        ['开启后几何', `${p.geometry} · ${p.mode} @ ${p.rate} Hz · 缩放 ${p.scale.toFixed(0)}%`],
+        ['关闭前记录', `${p.want[0]}, ${p.want[1]}${p.relocated ? ' · 会压住现有屏，已弃用' : ''}`],
+      ] : [['恢复参数', '无记录，只能按 xrandr 默认（--auto）']]),
+    ];
     kv.innerHTML = rows.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join('');
     card.appendChild(kv);
+
+    if(o.enabled && o.off_marked){
+      const hint = document.createElement('div');
+      hint.className = 'help';
+      hint.style.marginTop = '7px';
+      hint.textContent = '它在「你关闭的」名单里，但当前确实是亮的——多半是挂起/恢复时被系统重新点亮。' +
+                         '布局图按实际状态画；要关掉它请点下面的「关闭」，想保留现状就保持亮着（重启服务时会自动把它从名单里去掉）。';
+      card.appendChild(hint);
+    }
 
     if(o.enabled){
       const mwrap = buildModes(o);
@@ -711,6 +793,8 @@ function structuralSig(s){
       o.name, o.status, o.enabled, o.primary, o.panel, o.off_marked, o.idle,
       o.x, o.y, o.w, o.h, o.mode, o.rate, o.scale,
       o.transform ? o.transform[0] : null,
+      o.restore_preview ? [o.restore_preview.pos.join(','), o.restore_preview.relocated,
+                           o.restore_preview.mode, o.restore_preview.rate].join('|') : null,
       o.idle ? Math.floor((o.idle_seconds||0)/60) : null
     ]),
     // 亮度只放「能力」相关字段；具体数值不进签名，拖动时不重建 DOM

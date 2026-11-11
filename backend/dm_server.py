@@ -239,6 +239,12 @@ def serve(argv: list[str]) -> int:
     except Exception as e:
         core.log("模式切换启动自检异常: %r" % e)
 
+    # 对账：亮着的输出不该留在 .off 名单或「关闭前四件套」里（挂起/恢复常把它们弄脏）
+    try:
+        core.reconcile()
+    except Exception as e:
+        core.log("启动对账失败: %r" % e)
+
     print("display-manager 界面: %s" % url)
     print("闲置检测依据: %s" % rep["basis"])
     print("全局快捷键: %s = 恢复全部输出" % dm_hotkey.KEY_COMBO)

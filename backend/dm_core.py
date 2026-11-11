@@ -391,6 +391,13 @@ def snapshot() -> dict:
 
     enabled = [o for o in outputs if o["enabled"]]
     canvas = _bbox(enabled)
+    # 已关闭输出的「开启后会放这里」预告：只用于画虚线幽灵框，不进 canvas
+    previews = _restore_preview(outputs)
+    for o in outputs:
+        if o["name"] in previews:
+            o["restore_preview"] = previews[o["name"]]
+    # 在关闭名单里却亮着：状态文件被服务之外的操作弄脏了（挂起/恢复、手动 xrandr）
+    conflicts = [o["name"] for o in outputs if o["enabled"] and o["off_marked"]]
     idle_info = _attach_idle(outputs, time.time())
     try:
         import dm_brightness
@@ -406,6 +413,7 @@ def snapshot() -> dict:
         "enabled_count": len(enabled),
         "canvas": canvas,
         "off_marked": marked,
+        "conflicts": conflicts,
         "idle": idle_info,
         "config": load_config(),
         "state_records": [r.split()[0] for r in _read_lines(STATE_FILE)],
@@ -461,6 +469,91 @@ def _overlaps(outs: list[dict]) -> list[dict]:
             iy = min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"])
             if ix > 0 and iy > 0:
                 res.append({"a": a["name"], "b": b["name"], "w": ix, "h": iy})
+    return res
+
+
+def _hits(rect: dict, occupied: list[dict]) -> bool:
+    """rect 是否与 occupied 里的任一矩形相交（边界相接不算）。"""
+    for r in occupied:
+        if (rect["x"] < r["x"] + r["w"] and r["x"] < rect["x"] + rect["w"]
+                and rect["y"] < r["y"] + r["h"] and r["y"] < rect["y"] + rect["h"]):
+            return True
+    return False
+
+
+def _enabled_rects(outs: list[dict]) -> list[dict]:
+    return [{"x": o["x"], "y": o["y"], "w": o["w"], "h": o["h"]}
+            for o in outs if o["enabled"]]
+
+
+def plan_place(w: int, h: int, want, occupied: list[dict]):
+    """给将要启用的输出挑一个不会压住正在使用的屏的位置。
+
+    优先用关闭前记录的位置（用户的直觉：还回到原来那块地方）；只有当它和现有
+    屏相交时，才挪到现有布局的外侧：右 → 左 → 下 → 上。右侧在虚拟画布上总是
+    放得下，所以几乎总能给出不重叠的结果（放不下才抛错，宁可不点亮也不叠屏）。
+    返回 (pos, 是否挪动过)。
+    """
+    want = (int(want[0]), int(want[1]))
+    rect = {"x": want[0], "y": want[1], "w": int(w), "h": int(h)}
+    if not _hits(rect, occupied):
+        return want, False
+
+    minx = min(r["x"] for r in occupied)
+    miny = min(r["y"] for r in occupied)
+    maxx = max(r["x"] + r["w"] for r in occupied)
+    maxy = max(r["y"] + r["h"] for r in occupied)
+    for pos in ((maxx, want[1]), (minx - rect["w"], want[1]),
+                (want[0], maxy), (want[0], miny - rect["h"])):
+        if pos[0] < 0:
+            continue
+        if not _hits({"x": pos[0], "y": pos[1], "w": rect["w"], "h": rect["h"]}, occupied):
+            return (int(pos[0]), int(pos[1])), True
+    for k in range(1, 33):      # 兜底：一屏一屏往右挪，32767 是 X 的坐标上限
+        pos = (maxx + k * rect["w"], want[1])
+        if pos[0] + rect["w"] > 32767:
+            break
+        if not _hits({"x": pos[0], "y": pos[1], "w": rect["w"], "h": rect["h"]}, occupied):
+            return pos, True
+    raise DMError("虚拟画布放不下 %dx%d 的输出，为免叠屏不点亮" % (rect["w"], rect["h"]))
+
+
+def _restore_preview(outs: list[dict]) -> dict:
+    """给「已关闭但能恢复」的输出算一个落点，供界面画虚线幽灵框。
+
+    幽灵框只是「点开启后会放在这里」的预告：它按 plan_place 提前避开了现有屏，
+    所以永远不会和实心块重叠；画布尺寸（canvas）仍只统计已启用的输出。
+    """
+    occ = _enabled_rects(outs)
+    res = {}
+    for o in outs:
+        if not o["connected"] or o["enabled"]:
+            continue
+        rec = state_get(o["name"])
+        src = "state"
+        if not rec:
+            rec = wd_baseline(o["name"])
+            src = "watchdog"
+        if not rec:
+            continue
+        try:
+            w, h = (int(v) for v in rec["geometry"].lower().split("x"))
+        except (ValueError, AttributeError):
+            continue
+        try:
+            pos, moved = plan_place(w, h, rec["pos"], occ)
+        except DMError:
+            continue
+        res[o["name"]] = {
+            "source": src,
+            "mode": rec["mode"], "rate": rec["rate"],
+            "geometry": "%dx%d" % (w, h),
+            "want": [rec["pos"][0], rec["pos"][1]],
+            "pos": [pos[0], pos[1]],
+            "relocated": moved,
+            "scale": round(w * 100.0 / (int(rec["mode"].split("x")[0]) or 1), 1),
+        }
+        occ.append({"x": pos[0], "y": pos[1], "w": w, "h": h})
     return res
 
 
@@ -612,6 +705,18 @@ def turn_on(name: str, reason: str = "cli") -> dict:
                 "message": "%s 已经处于启用状态，无需操作" % name}
 
     rec, src = _resolve_restore(name)
+    # 关闭期间别的屏可能挪过位置：记录里的位置若会压住正在用的屏，先自动避让。
+    # 位置是恢复四件套里唯一「可能伤到别人」的一项，模式/刷新率/transform 仍按记录走。
+    want = rec["pos"]
+    moved = False
+    try:
+        rw, rh = (int(v) for v in rec["geometry"].lower().split("x"))
+    except (ValueError, AttributeError):
+        rw = rh = 0
+    if rw and rh:
+        pos, moved = plan_place(rw, rh, want, _enabled_rects(snap["outputs"]))
+        rec = dict(rec, pos=pos)
+
     args = ["--output", name, "--mode", rec["mode"]]
     if rec["rate"] and rec["rate"] != "0.00":
         args += ["--rate", rec["rate"]]
@@ -622,6 +727,8 @@ def turn_on(name: str, reason: str = "cli") -> dict:
     if rec["primary"]:
         args += ["--primary"]
 
+    if moved:
+        log("恢复位置 %dx%d 会压住正在使用的输出，改到 %dx%d" % (want[0], want[1], rec["pos"][0], rec["pos"][1]))
     log("恢复 %s（依据 %s）: %s" % (name, src, " ".join(args)))
     rc, out, err = xrandr(args)
     if rc != 0:
@@ -638,9 +745,12 @@ def turn_on(name: str, reason: str = "cli") -> dict:
                            rec["pos"][0], rec["pos"][1])
     actual = "%dx%d+%d+%d" % (got["w"], got["h"], got["x"], got["y"]) if got["enabled"] else "(未启用)"
     warn = None
+    if moved:
+        warn = "记录位置 %d,%d 会压住正在使用的屏，已改放到 %d,%d" % (
+            want[0], want[1], rec["pos"][0], rec["pos"][1])
     if actual != exp:
-        warn = "恢复后几何与记录不一致：期望 %s，实际 %s" % (exp, actual)
-        log("警告: " + warn)
+        warn = (warn + "；" if warn else "") + "恢复后几何与记录不一致：期望 %s，实际 %s" % (exp, actual)
+        log("警告: 恢复后几何与记录不一致：期望 %s，实际 %s" % (exp, actual))
     ov = after["overlaps"]
     if ov:
         warn = (warn + "；" if warn else "") + "存在重叠: " + ", ".join(
@@ -793,6 +903,37 @@ def brightness_state(refresh: bool = False) -> dict:
         details = _parse_details(out)
     import dm_brightness
     return dm_brightness.summary(snap["outputs"], details, refresh=True)
+
+
+def reconcile(reason: str = "启动") -> list[str]:
+    """对账：亮着的输出不该留在「关闭名单」或「关闭前四件套」里。
+
+    挂起/恢复、mutter 重新点亮、手动 xrandr 都可能绕过本服务，让状态文件变脏：
+    - 在 .off 里却亮着 → 名单失去意义（看门狗会漏判），移除；
+    - 有「关闭前四件套」却亮着 → 那是关闭期间的快照，早就过期（例如 DP-0 记的是
+      4K@160/150%，实际早跑到 4K@60/100%），留着下次开启会把旧位置（常常是 0,0）
+      压回正在用的屏上，删掉。
+
+    只改状态文件，不改任何显示布局。
+    """
+    snap = snapshot()
+    notes = []
+    for o in snap["outputs"]:
+        if not o["enabled"]:
+            continue
+        if o["off_marked"]:
+            off_unmark(o["name"])
+            notes.append("%s 在 .off 名单里但当前是亮的（多半是挂起/恢复时被系统点亮），已从名单移除"
+                         % o["name"])
+        rec = state_get(o["name"])
+        if rec:
+            state_drop(o["name"])
+            notes.append("%s 有已过期的关闭前记录（%s@%s %d,%d 几何 %s），但它现在是亮的，已删除"
+                         % (o["name"], rec["mode"], rec["rate"],
+                            rec["pos"][0], rec["pos"][1], rec["geometry"]))
+    for n in notes:
+        log("%s对账: %s" % (reason, n))
+    return notes
 
 
 def restore_all(reason: str = "cli") -> dict:
