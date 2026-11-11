@@ -199,14 +199,14 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 {
   "version": 1,
   "confirmed": true,
-  "updated": "2026-11-11 18:50:00",
+  "updated": "2026-11-11 18:52:50",
   "outputs": {
     "DP-0":   {"mode": "3840x2160", "rate": "160.00",
                "transform": [1.333313, 0, 0, 0, 1.333313, 0, 0, 0, 1],
                "pos": [0, 0], "geometry": "5120x2880", "primary": true},
     "DP-4":   {"mode": "2560x1600", "rate": "165.00",
                "transform": [1.331238, 0, 0, 0, 1.331238, 0, 0, 0, 1],
-               "pos": [7585, 0], "geometry": "3408x2130", "primary": false},
+               "pos": [881, 2880], "geometry": "3408x2130", "primary": false},
     "HDMI-0": {"mode": "2880x1800", "rate": "100.00",
                "transform": [1.14444, 0, 0, 0, 1.14444, 0, 0, 0, 1],
                "pos": [4289, 2880], "geometry": "3296x2060", "primary": false}
@@ -215,6 +215,9 @@ python3 backend/dm_cli.py serve           # 等价于 start.sh
 ```
 
 - `outputs` 收录所有连接过的输出（含当前关着的）；**关屏只改 `.off`，不动这里**。
+- 上例即 2026-11-11 用户确认的基准摆位（GNOME 面板：2 上、1 左下、3 右下）：DP-0 独占上排，
+  DP-4 与 HDMI-0 并排在下排，固定画布 `7585x5010`；实际 DP-4 若被 GNOME 挪到别处，页面会用琥珀虚线
+  标出 `881,2880` 这个「关掉再开会落回」的位置，但不擅自挪屏。
 - `pos/geometry` 是 CRTC 坐标与尺寸（`geometry = mode × transform`），`transform` 常数项固定为 0。
 - `confirmed`：是否经用户确认。首次建库一定是 `false`，页面显示「待你确认」。
 
