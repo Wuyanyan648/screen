@@ -42,6 +42,20 @@
       "unit": "theme-manager.service",
       "start_on_login": true,
       "note": "纯用户态 gsettings/dconf + Trae settings.json；应用前自动备份到 ~/.local/share/theme-manager-backup/，可逐份还原。"
+    },
+    {
+      "id": "usb-devices",
+      "name": "USB 设备",
+      "desc": "USB 拓扑与端口供电/带宽、开机枚举失败历史，按设备开关通信链路。",
+      "url": "http://127.0.0.1:8795/",
+      "health": "/api/health",
+      "icon": "🔌",
+      "color": "#f0883e",
+      "embed": true,
+      "manage": "system-unit",
+      "unit": "usbdevd.service",
+      "start_on_login": true,
+      "note": "系统级 root 单元（写 sysfs authorized 需要 root）；网卡/键鼠/HID/已挂载存储默认禁止关闭链路。"
     }
   ]
 }
