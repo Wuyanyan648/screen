@@ -88,6 +88,9 @@
   .cardActions{display:flex;gap:8px;margin-top:9px}
   .cardActions button{flex:1;padding:5px 8px}
   .help{font-size:11.5px;color:var(--dim);line-height:1.65}
+  /* 视频输入（采集卡）单独分区：不是显示器，不参与屏数/布局 */
+  .captureSec{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
+  .captureSec h3{margin:0 0 6px;font-size:13px;display:flex;align-items:center;gap:6px}
   /* 亮度滑杆 */
   .bright{margin-top:9px;border-top:1px dashed var(--line);padding-top:8px}
   .brightHead{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);flex-wrap:wrap}
@@ -210,7 +213,7 @@
 <header>
   <h1>显示器输出管理</h1>
   <span id="conn" class="conn">● 连接中…</span>
-  <div class="meta">固定布局 <b id="canvasSize">-</b> · 当前 <b id="canvasLive">-</b> · 启用 <b id="enabledCount">-</b> 块 · 更新于 <b id="stamp">-</b></div>
+  <div class="meta">固定布局 <b id="canvasSize">-</b> · 当前 <b id="canvasLive">-</b> · 启用 <b id="enabledCount">-</b> 块 · 采集卡 <b id="captureCount">-</b> · 更新于 <b id="stamp">-</b></div>
   <div class="spacer"></div>
   <label class="meta" style="display:flex;align-items:center;gap:6px">
     闲置阈值
@@ -405,7 +408,7 @@ function svgButton(parent, o, label, disabled, isDanger, onClick){
 function renderCanvas(){
   const svg = $('#layout');
   svg.innerHTML = '';
-  const on = state.outputs.filter(o=>o.enabled);
+  const on = state.outputs.filter(o=>o.enabled && !o.capture);
   if(!on.length){
     svg.setAttribute('viewBox', '0 0 100 60');
     svgText(svg, 50, 32, '当前没有任何启用的输出', 4, '#8b98a5');
@@ -414,7 +417,7 @@ function renderCanvas(){
   // 大块先画、小块后画：真重叠时小块压在上面，和实际「后配置的盖住先配置的」一致
   const onSorted = on.slice().sort((a,b)=> b.w*b.h - a.w*a.h);
   // 已关闭但有恢复记录的输出：只画虚线幽灵框，预告「点开启后会放在这里」（后端已算好避让位置）
-  const ghosts = state.outputs.filter(o=>o.restore_preview);
+  const ghosts = state.outputs.filter(o=>o.restore_preview && !o.capture);
   const gwh = g => g.restore_preview.geometry.split('x').map(Number);
   const box = state.canvas;          // 规范布局的 union：所有输出都在框内，跟着开关不变
   const pad = Math.max(...on.map(o=>o.h), box ? box.h : 0) * 0.025;
@@ -595,7 +598,7 @@ function fmtDur(sec){
 function renderTray(){
   const tray = $('#offTray');
   tray.innerHTML = '';
-  const off = state.outputs.filter(o=>o.status==='connected' && !o.enabled);
+  const off = state.outputs.filter(o=>o.status==='connected' && !o.enabled && !o.capture);
   if(!off.length) return;
   const label = document.createElement('span');
   label.className = 'meta';
@@ -699,6 +702,7 @@ function renderCards(){
   box.innerHTML = '';
   for(const o of state.outputs){
     if(o.status === 'disconnected') continue;   // 未连接的输出没有可操作价值，略过
+    if(o.capture) continue;                     // 采集卡走下面的「视频输入」分区
     const card = document.createElement('div');
     card.className = 'card' + (o.name===selected ? ' sel':'');
     const badges = [];
@@ -782,6 +786,62 @@ function renderCards(){
     card.onclick = ()=>{ selected = o.name; render(true); };
     box.appendChild(card);
   }
+  renderCaptureCards(box);
+}
+
+/* 视频输入（采集卡）：按 EDID 识别，单独分区展示，不进入屏数 / 布局 / primary */
+function renderCaptureCards(box){
+  const caps = state.outputs.filter(o=>o.capture && o.status !== 'disconnected');
+  if(!caps.length) return;
+  const sec = document.createElement('div');
+  sec.className = 'captureSec';
+  const h = document.createElement('h3');
+  h.innerHTML = '视频输入 <span class="badge info">采集卡</span>';
+  sec.appendChild(h);
+  const tip = document.createElement('div');
+  tip.className = 'help';
+  tip.style.marginBottom = '7px';
+  tip.textContent = '按 EDID 识别为 UVC 采集设备，不是显示器：不计入屏数、不参与固定布局与模式重放、不会成为 primary。';
+  sec.appendChild(tip);
+  for(const o of caps) sec.appendChild(captureCard(o));
+  box.appendChild(sec);
+}
+
+function captureCard(o){
+  const card = document.createElement('div');
+  card.className = 'card' + (o.name===selected ? ' sel':'');
+  card.innerHTML = `<h3>${o.name} <span class="badge info">视频输入</span>` +
+    (o.enabled ? '<span class="badge live">信号在线</span>' : '<span class="badge dead">已关闭</span>') + '</h3>';
+  const kv = document.createElement('div');
+  kv.className = 'kv';
+  const rows = o.enabled ? [
+    ['接口', o.connector_type],
+    ['信号', `${o.mode} @ ${o.rate} Hz`],
+    ['帧缓冲', `${o.w}×${o.h} @ ${o.x},${o.y}`],
+    ['布局', '不参与（无固定坐标）'],
+  ] : [
+    ['接口', o.connector_type],
+    ['状态', '已关闭（采集信号中断）'],
+    ['点亮', '只按驱动 --auto，不套规范布局'],
+  ];
+  kv.innerHTML = rows.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join('');
+  card.appendChild(kv);
+  const acts = document.createElement('div');
+  acts.className = 'cardActions';
+  const b = document.createElement('button');
+  if(o.enabled){
+    b.className = 'danger';
+    b.textContent = '关闭采集';
+    b.onclick = e=>{ e.stopPropagation(); doOff(o.name); };
+  }else{
+    b.className = 'primary';
+    b.textContent = '点亮采集';
+    b.onclick = e=>{ e.stopPropagation(); doOn(o.name); };
+  }
+  acts.appendChild(b);
+  card.appendChild(acts);
+  card.onclick = ()=>{ selected = o.name; render(true); };
+  return card;
 }
 
 function syncThreshold(){
@@ -903,6 +963,7 @@ function structuralSig(s){
     sel: selected,
     o: s.outputs.map(o=>[
       o.name, o.status, o.enabled, o.primary, o.panel, o.off_marked, o.idle,
+      o.capture,
       o.x, o.y, o.w, o.h, o.mode, o.rate, o.scale,
       o.transform ? o.transform[0] : null,
       o.restore_preview ? [o.restore_preview.pos.join(','), o.restore_preview.relocated,
@@ -930,6 +991,7 @@ function render(force){
   $('#canvasSize').textContent = fmtCanvas(state.canvas);
   $('#canvasLive').textContent = fmtCanvas(state.canvas_live);
   $('#enabledCount').textContent = state.enabled_count;
+  $('#captureCount').textContent = state.capture_count || 0;
   $('#idleBasis').textContent = state.idle ? state.idle.basis : '-';
   syncThreshold();
   renderCanvas();

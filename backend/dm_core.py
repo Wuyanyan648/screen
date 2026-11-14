@@ -258,6 +258,53 @@ def _parse_details(text: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# 采集卡（UVC 视频输入）识别
+# --------------------------------------------------------------------------- #
+# 按 EDID 判定，不按输出名：采集卡换个 HDMI/DP 口后 connector 会变（HDMI-0/DP-2…），
+# 但 EDID 里的 PNP 厂商号和产品名不变。UGREEN 95348 这类 USB 采集棒会伪装成一块
+# 1080p 显示器，好让显卡吐出可采集的信号——它没有面板、没有背光，不是给人看的屏。
+CAPTURE_PNP_IDS = {"UGR"}          # UGREEN
+CAPTURE_NAME_HINTS = ("UGREEN", "CAPTURE", "GRABBER", "GAME CAPTURE")
+
+# screen_rects() 只跑轻量 `xrandr --current`（不读 EDID），这里缓存最近一次
+# 全量快照里识别出的采集卡名字，供护眼/闲置等高频率路径过滤。
+_CAPTURE_NAMES: set[str] = set()
+
+
+def _edid_identity(edid: bytes | None) -> dict | None:
+    """从 EDID 取 PNP 厂商号 / 产品码 / 产品名（0xFC 描述符）。"""
+    if not edid or len(edid) < 128:
+        return None
+    raw = int.from_bytes(edid[8:10], "big")
+    pnp = "".join(chr(ord("A") + ((raw >> s) & 0x1F) - 1) for s in (10, 5, 0))
+    name = ""
+    for off in range(54, 126, 18):
+        d = edid[off:off + 18]
+        if len(d) < 18 or d[0:3] != b"\x00\x00\x00":
+            continue
+        if d[3] == 0xFC:
+            name = d[5:18].split(b"\x0a")[0].decode("ascii", "replace").strip()
+            break
+    return {"pnp": pnp, "product": "0x%04x" % int.from_bytes(edid[10:12], "little"),
+            "name": name}
+
+
+def is_capture_sink(edid: bytes | None) -> bool:
+    """这块输出是不是采集卡（视频输入）而不是显示器。"""
+    ids = _edid_identity(edid)
+    if not ids:
+        return False
+    if ids["pnp"].upper() in CAPTURE_PNP_IDS:
+        return True
+    up = ids["name"].upper()
+    return any(h in up for h in CAPTURE_NAME_HINTS)
+
+
+def capture_names() -> set[str]:
+    return set(_CAPTURE_NAMES)
+
+
+# --------------------------------------------------------------------------- #
 # 状态文件
 # --------------------------------------------------------------------------- #
 def _read_lines(path: str) -> list[str]:
@@ -446,6 +493,8 @@ def layout_ensure(outs: list[dict]) -> dict:
     for o in sorted(outs, key=lambda x: (not x["enabled"], x["name"])):
         if not o["connected"]:
             continue
+        if o.get("capture"):        # 采集卡不进规范布局
+            continue
         base = _entry_of(o) if o["enabled"] else None
         if base is None:
             for src in (state_get(o["name"]), wd_baseline(o["name"])):
@@ -491,7 +540,7 @@ def layout_claim(outs: list[dict]) -> dict:
     lay = layout_load()
     entries = dict(lay["outputs"])
     for o in outs:
-        if o["enabled"]:
+        if o["enabled"] and not o.get("capture"):
             entries[o["name"]] = _entry_of(o)
     lay["outputs"] = entries
     lay["confirmed"] = True
@@ -582,10 +631,13 @@ def snapshot() -> dict:
                 mh = int(o["mode"].split("x")[1]) or 1
                 tr = [o["w"] / mw, 0.0, 0.0, 0.0, o["h"] / mh, 0.0, 0.0, 0.0, 1.0]
         ct = d.get("connector_type") or ""
+        capture = is_capture_sink(d.get("edid"))
         outputs.append({
             **o,
             "id": o["name"],
             "panel": ct.lower() == "panel",
+            "capture": capture,
+            "kind": "capture" if capture else ("panel" if ct.lower() == "panel" else "display"),
             "connector_type": ct or "未知",
             "transform": tr,
             "scale": scale,
@@ -593,8 +645,17 @@ def snapshot() -> dict:
             "crtc": [o["x"], o["y"], o["w"], o["h"]] if o["enabled"] else None,
         })
 
-    enabled = [o for o in outputs if o["enabled"]]
+    # 采集卡是视频输入，不计入「启用的显示器」：数量、画布、重叠判定都按真屏算
+    _CAPTURE_NAMES.clear()
+    _CAPTURE_NAMES.update(o["name"] for o in outputs if o["capture"])
+    enabled = [o for o in outputs if o["enabled"] and not o["capture"]]
     lay = layout_load()
+    # 采集卡不该出现在规范布局里（历史坏数据自愈）：一旦识别出来就从 layout.json 摘掉
+    stale = [o["name"] for o in outputs if o["capture"] and o["name"] in lay["outputs"]]
+    if stale:
+        for n in stale:
+            lay["outputs"].pop(n, None)
+        layout_save(lay, "采集卡 %s 不参与显示器布局，已移除" % "/".join(stale))
     # 画布按「规范布局」算：所有输出的 union，不随开关组合变化
     canvas = layout_canvas(lay) or _bbox(enabled)
     # 已关闭输出的「开启后会放这里」预告：只用于画虚线幽灵框，不进 canvas
@@ -614,7 +675,9 @@ def snapshot() -> dict:
             if (o["x"], o["y"], o["w"], o["h"]) != (e["pos"][0], e["pos"][1], w, h):
                 o["drift"] = {"pos": e["pos"], "geometry": e["geometry"]}
     # 在关闭名单里却亮着：状态文件被服务之外的操作弄脏了（挂起/恢复、手动 xrandr）
-    conflicts = [o["name"] for o in outputs if o["enabled"] and o["off_marked"]]
+    # 采集卡不走这套开关语义，不算冲突
+    conflicts = [o["name"] for o in outputs
+                 if o["enabled"] and o["off_marked"] and not o["capture"]]
     idle_info = _attach_idle(outputs, time.time())
     try:
         import dm_brightness
@@ -628,6 +691,7 @@ def snapshot() -> dict:
         "outputs": outputs,
         "brightness": bright,
         "enabled_count": len(enabled),
+        "capture_count": sum(1 for o in outputs if o["connected"] and o["capture"]),
         "canvas": canvas,
         "canvas_live": _bbox(enabled),
         "layout": {
@@ -685,7 +749,7 @@ def _bbox(outs: list[dict]) -> dict:
 
 
 def _overlaps(outs: list[dict]) -> list[dict]:
-    en = [o for o in outs if o["enabled"]]
+    en = [o for o in outs if o["enabled"] and not o.get("capture")]
     res = []
     for i, a in enumerate(en):
         for b in en[i + 1:]:
@@ -707,7 +771,7 @@ def _hits(rect: dict, occupied: list[dict]) -> bool:
 
 def _enabled_rects(outs: list[dict]) -> list[dict]:
     return [{"x": o["x"], "y": o["y"], "w": o["w"], "h": o["h"]}
-            for o in outs if o["enabled"]]
+            for o in outs if o["enabled"] and not o.get("capture")]
 
 
 def plan_place(w: int, h: int, want, occupied: list[dict]):
@@ -752,7 +816,7 @@ def _restore_preview(outs: list[dict], lay: dict | None = None) -> dict:
     occ = _enabled_rects(outs)
     res = {}
     for o in outs:
-        if not o["connected"] or o["enabled"]:
+        if not o["connected"] or o["enabled"] or o.get("capture"):
             continue
         e = lay["outputs"].get(o["name"])
         if e:
@@ -811,7 +875,8 @@ def screen_rects() -> list[dict]:
     rc, out, _ = xrandr([])
     if rc != 0:
         return []
-    return [o for o in _parse_query(out)["outputs"] if o["enabled"]]
+    cap = capture_names()
+    return [o for o in _parse_query(out)["outputs"] if o["enabled"] and o["name"] not in cap]
 
 
 def _attach_idle(outputs: list[dict], now: float) -> dict:
@@ -861,12 +926,13 @@ def plan_off(name: str) -> dict:
         raise DMError("%s 当前不是 connected（%s），无法关闭" % (name, o["status"]))
     if not o["enabled"]:
         raise DMError("%s 已经是关闭状态" % name)
-    if snap["enabled_count"] <= 1:
-        raise DMError("拒绝关闭：%s 是当前唯一启用的输出，关掉后将没有任何显示输出" % name)
+    if not o.get("capture") and snap["enabled_count"] <= 1:
+        raise DMError("拒绝关闭：%s 是当前唯一启用的显示器，关掉后将没有任何显示输出" % name)
     if not o["mode"] or not o["rate"]:
         raise DMError("无法从 xrandr 读出 %s 的当前模式/刷新率，为安全起见不关闭" % name)
 
-    rest = [x for x in snap["outputs"] if x["enabled"] and x["name"] != name]
+    rest = [x for x in snap["outputs"]
+            if x["enabled"] and x["name"] != name and not x.get("capture")]
     return {
         "name": name,
         "panel": o["panel"],
@@ -887,7 +953,12 @@ def turn_off(name: str, reason: str = "cli") -> dict:
     tr = o["transform"] or list(IDENTITY)
     # 关屏不改几何：规范布局里已有它就原样保留；只有第一次见到的新输出才补一条
     lay = layout_load()
-    if name in lay["outputs"]:
+    if o.get("capture"):
+        # 采集卡不是显示器：不登记固定几何，历史残留也一并摘掉
+        if lay["outputs"].pop(name, None) is not None:
+            layout_save(lay, "关闭采集卡 %s 时移除其布局记录" % name)
+        log("关闭采集卡 %s（视频输入，不参与显示器布局）(%s)" % (name, reason))
+    elif name in lay["outputs"]:
         log("关闭 %s（关闭不改固定几何 %d,%d，仍按规范布局保留）(%s)" % (
             name, lay["outputs"][name]["pos"][0], lay["outputs"][name]["pos"][1], reason))
     else:
@@ -941,6 +1012,20 @@ def turn_on(name: str, reason: str = "cli") -> dict:
         off_unmark(name)
         return {"ok": True, "action": "on", "name": name, "state": snap,
                 "message": "%s 已经处于启用状态，无需操作" % name}
+
+    if o.get("capture"):
+        # 采集卡是视频输入：只负责「亮起来」，不套规范布局、不抢 primary、不改别人的几何
+        rc, out, err = xrandr(["--output", name, "--auto"])
+        if rc != 0:
+            detail = (err or out).strip()
+            log("启用采集卡 %s 失败 rc=%d ；xrandr stderr: %s" % (name, rc, detail))
+            raise DMError("xrandr 启用采集卡 %s 失败（rc=%d）：%s" % (name, rc, detail or "无输出"))
+        state_drop(name)
+        off_unmark(name)
+        after = snapshot()
+        log("启用采集卡 %s（视频输入，按 --auto 点亮，不参与布局重放）(%s)" % (name, reason))
+        return {"ok": True, "action": "on", "name": name, "capture": True, "state": after,
+                "message": "%s 是采集卡（视频输入），已按驱动默认模式点亮" % name}
 
     # 首选规范布局：每块屏在全局几何里的坐标是固定的，先开谁后开谁都不影响
     lay = layout_load()
@@ -1172,11 +1257,11 @@ def reconcile(reason: str = "启动") -> list[str]:
             off_unmark(o["name"])
             notes.append("%s 在 .off 名单里但当前是亮的（多半是挂起/恢复时被系统点亮），已从名单移除"
                          % o["name"])
-        if o["enabled"] and o["name"] not in lay["outputs"]:
+        if o["enabled"] and not o["capture"] and o["name"] not in lay["outputs"]:
             lay["outputs"][o["name"]] = _entry_of(o)
             layout_save(lay, "对账补登 %s" % o["name"])
             notes.append("%s 不在规范布局里，已按当前几何补登 %d,%d" % (o["name"], o["x"], o["y"]))
-        if o.get("drift"):
+        if o.get("drift") and not o["capture"]:
             notes.append("%s 当前 %d,%d 偏离固定位置 %d,%d（%s）；要挪回请关掉再开启"
                          % (o["name"], o["x"], o["y"],
                             o["drift"]["pos"][0], o["drift"]["pos"][1], o["drift"]["geometry"]))
@@ -1188,7 +1273,7 @@ def reconcile(reason: str = "启动") -> list[str]:
 def restore_all(reason: str = "cli") -> dict:
     snap = snapshot()
     todo = [o["name"] for o in snap["outputs"]
-            if o["connected"] and not o["enabled"]
+            if o["connected"] and not o["enabled"] and not o["capture"]
             and (state_get(o["name"]) or wd_baseline(o["name"]))]
     if not todo:
         return {"ok": True, "message": "没有需要恢复的输出", "state": snap}
@@ -1224,6 +1309,8 @@ def describe(snap: dict) -> str:
         notes = []
         if o["primary"]:
             notes.append("primary")
+        if o["capture"]:
+            notes.append("采集卡/视频输入")
         if o["panel"]:
             notes.append("内屏")
         if o["off_marked"]:
